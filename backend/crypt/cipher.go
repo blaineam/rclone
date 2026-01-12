@@ -22,10 +22,10 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/lib/readers"
+	"github.com/rclone/rclone/lib/scryptcache"
 	"github.com/rclone/rclone/lib/version"
 	"github.com/rfjakob/eme"
 	"golang.org/x/crypto/nacl/secretbox"
-	"golang.org/x/crypto/scrypt"
 )
 
 // Constants
@@ -238,7 +238,10 @@ func (c *Cipher) Key(password, salt string) (err error) {
 	if password == "" {
 		key = make([]byte, keySize)
 	} else {
-		key, err = scrypt.Key([]byte(password), saltBytes, 16384, 8, 1, keySize)
+		// Use scryptcache.Key which caches derived keys to disk.
+		// This allows the FPE (20MB memory limit) to load pre-derived keys
+		// instead of running scrypt (which needs 32MB).
+		key, err = scryptcache.Key([]byte(password), saltBytes, 16384, 8, 1, keySize)
 		if err != nil {
 			return err
 		}
