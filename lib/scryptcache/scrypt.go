@@ -1,21 +1,27 @@
-// Package scryptcache wraps golang.org/x/crypto/scrypt with disk-based key caching.
+// Package scrypt wraps golang.org/x/crypto/scrypt with disk-based key caching.
 // This is critical for the File Provider Extension (FPE) which has a 20MB memory limit,
 // while scrypt with rclone's default parameters requires 32MB.
 //
-// Security: Cached keys are stored in the App Group container, which is sandboxed
-// to this app only. The iOS sandbox is the security boundary.
+// Security: Cached keys are encrypted using AES-GCM with the shared app password,
+// ensuring that even if the device is compromised, the cached scrypt values
+// cannot be easily obtained.
 //
 // Usage:
-// - Main app (full build): Derives keys normally and caches them to disk
-// - FPE (slim build): Loads cached keys from disk, avoiding scrypt memory spike
+// - Main app (full build): Derives keys normally and caches them encrypted to disk
+// - FPE (slim build): Loads and decrypts cached keys from disk, avoiding scrypt memory spike
 package scryptcache
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"golang.org/x/crypto/pbkdf2"
@@ -27,6 +33,11 @@ var (
 	cacheDir   string
 	cacheDirMu sync.RWMutex
 
+	// encryptionPassword is the shared app password used to encrypt cached keys
+	// This should be set from SharedData.sharedPassword
+	encryptionPassword string
+	encryptionMu       sync.RWMutex
+
 	// isSlimBuild indicates if this is the FPE slim build (load-only mode)
 	isSlimBuild bool
 )
@@ -37,18 +48,97 @@ func SetCacheDir(dir string) {
 	cacheDirMu.Lock()
 	defer cacheDirMu.Unlock()
 	cacheDir = dir
+	fmt.Printf("[scryptcache] Cache dir set to: %s\n", dir)
 }
 
-// SetEncryptionPassword is kept for API compatibility but no longer used.
-// Keys are stored unencrypted since the App Group sandbox provides security.
+// SetEncryptionPassword sets the password used to encrypt cached keys.
+// This should be the shared app password that rotates every 24 hours.
 func SetEncryptionPassword(password string) {
-	// No-op - encryption removed, App Group sandbox provides security
+	encryptionMu.Lock()
+	defer encryptionMu.Unlock()
+	encryptionPassword = password
+	if password != "" {
+		// Log a hash of the password for debugging (to verify FPE and main app use same password)
+		h := sha256.Sum256([]byte(password))
+		passwordHash := hex.EncodeToString(h[:8])
+		fmt.Printf("[scryptcache] Encryption password set (len=%d, hash=%s)\n", len(password), passwordHash)
+	}
+}
+
+// GetEncryptionPassword returns the current encryption password.
+// Used by temp file encryption to share the same password.
+func GetEncryptionPassword() string {
+	encryptionMu.RLock()
+	defer encryptionMu.RUnlock()
+	return encryptionPassword
 }
 
 // SetSlimBuild marks this as the FPE slim build (load-only mode).
 // When true, Key() will only load cached keys and never derive new ones.
 func SetSlimBuild(slim bool) {
 	isSlimBuild = slim
+	if slim {
+		fmt.Println("[scryptcache] Running in SLIM mode (load-only)")
+	} else {
+		fmt.Println("[scryptcache] Running in FULL mode (derive + cache)")
+	}
+}
+
+// ValidateAndCleanCache checks all cached keys and removes any that can't be decrypted.
+// This should be called at startup to clean up stale cache files from password rotation.
+// Returns the number of valid keys and number of stale keys removed.
+func ValidateAndCleanCache() (validCount int, staleCount int) {
+	cacheDirMu.RLock()
+	currentDir := cacheDir
+	cacheDirMu.RUnlock()
+
+	if currentDir == "" {
+		return 0, 0
+	}
+
+	encryptionMu.RLock()
+	password := encryptionPassword
+	encryptionMu.RUnlock()
+
+	if password == "" {
+		fmt.Println("[scryptcache] ⚠️ Cannot validate cache - no encryption password set")
+		return 0, 0
+	}
+
+	cacheSubDir := filepath.Join(currentDir, "scrypt_cache")
+	entries, err := os.ReadDir(cacheSubDir)
+	if err != nil {
+		return 0, 0
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".key") {
+			continue
+		}
+
+		filePath := filepath.Join(cacheSubDir, entry.Name())
+		ciphertext, err := os.ReadFile(filePath)
+		if err != nil {
+			continue
+		}
+
+		// Try to decrypt
+		_, err = decryptData(ciphertext, password)
+		if err != nil {
+			// Can't decrypt - stale cache from old password
+			fmt.Printf("[scryptcache] 🗑️ Removing stale cache file (password mismatch): %s\n", entry.Name())
+			os.Remove(filePath)
+			staleCount++
+		} else {
+			validCount++
+		}
+	}
+
+	if staleCount > 0 {
+		fmt.Printf("[scryptcache] ✅ Cache validation complete: %d valid, %d stale removed\n", validCount, staleCount)
+	}
+
+	return validCount, staleCount
 }
 
 // GetDebugState returns the current scrypt cache state as a debug string.
@@ -56,6 +146,10 @@ func GetDebugState() string {
 	cacheDirMu.RLock()
 	currentDir := cacheDir
 	cacheDirMu.RUnlock()
+
+	encryptionMu.RLock()
+	hasPassword := encryptionPassword != ""
+	encryptionMu.RUnlock()
 
 	cacheSubDir := filepath.Join(currentDir, "scrypt_cache")
 	cacheDirExists := false
@@ -72,8 +166,69 @@ func GetDebugState() string {
 	}
 
 	return fmt.Sprintf(
-		"ScryptCache State: cacheDir='%s', isSlimBuild=%v, cacheDirExists=%v, cacheFiles=%v",
-		currentDir, isSlimBuild, cacheDirExists, cacheFiles)
+		"ScryptCache State: cacheDir='%s', isSlimBuild=%v, hasEncryptionPassword=%v, cacheDirExists=%v, cacheFiles=%v",
+		currentDir, isSlimBuild, hasPassword, cacheDirExists, cacheFiles)
+}
+
+// deriveEncryptionKey derives an AES key from the shared password
+func deriveEncryptionKey(password string) []byte {
+	// Use PBKDF2 with SHA256 to derive a 32-byte AES key
+	// Using a fixed salt since the password already rotates
+	salt := []byte("enter-space-scrypt-cache-v1")
+	return pbkdf2.Key([]byte(password), salt, 10000, 32, sha256.New)
+}
+
+// encryptData encrypts data using AES-GCM
+func encryptData(plaintext []byte, password string) ([]byte, error) {
+	key := deriveEncryptionKey(password)
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	// Generate random nonce
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+
+	// Encrypt and prepend nonce
+	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
+	return ciphertext, nil
+}
+
+// decryptData decrypts data using AES-GCM
+func decryptData(ciphertext []byte, password string) ([]byte, error) {
+	key := deriveEncryptionKey(password)
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return plaintext, nil
 }
 
 // getCacheFilePath returns the path to the cache file for given scrypt parameters.
@@ -96,30 +251,65 @@ func getCacheFilePath(password, salt []byte, N, r, p, keyLen int) string {
 	return filepath.Join(cacheDir, "scrypt_cache", hash+".key")
 }
 
-// loadCachedKey attempts to load a cached key from disk.
+// loadCachedKey attempts to load and decrypt a cached key from disk.
 // Returns nil if no cache exists or on error.
 func loadCachedKey(cacheFile string, expectedLen int) []byte {
 	if cacheFile == "" {
 		return nil
 	}
 
-	data, err := os.ReadFile(cacheFile)
+	encryptionMu.RLock()
+	password := encryptionPassword
+	encryptionMu.RUnlock()
+
+	if password == "" {
+		fmt.Println("[scryptcache] ⚠️ No encryption password set, cannot load cached key")
+		return nil
+	}
+
+	ciphertext, err := os.ReadFile(cacheFile)
 	if err != nil {
+		return nil
+	}
+
+	// Decrypt the cached key
+	data, err := decryptData(ciphertext, password)
+	if err != nil {
+		fmt.Printf("[scryptcache] ⚠️ Failed to decrypt cached key (password may have changed): %v\n", err)
+		// Delete the stale cache file
+		os.Remove(cacheFile)
 		return nil
 	}
 
 	// Verify length matches expected
 	if len(data) != expectedLen {
+		fmt.Printf("[scryptcache] ⚠️ Cache file has wrong length: %d vs expected %d\n", len(data), expectedLen)
 		return nil
 	}
 
+	fmt.Printf("[scryptcache] ✅ Loaded and decrypted cached key from: %s\n", cacheFile)
 	return data
 }
 
-// saveCachedKey saves a derived key to disk for future use.
+// saveCachedKey encrypts and saves a derived key to disk for future use.
 func saveCachedKey(cacheFile string, key []byte) error {
 	if cacheFile == "" {
 		return nil
+	}
+
+	encryptionMu.RLock()
+	password := encryptionPassword
+	encryptionMu.RUnlock()
+
+	if password == "" {
+		fmt.Println("[scryptcache] ⚠️ No encryption password set, cannot save cached key")
+		return fmt.Errorf("no encryption password set")
+	}
+
+	// Encrypt the key
+	ciphertext, err := encryptData(key, password)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt key: %w", err)
 	}
 
 	// Ensure directory exists
@@ -128,11 +318,12 @@ func saveCachedKey(cacheFile string, key []byte) error {
 		return fmt.Errorf("failed to create cache dir: %w", err)
 	}
 
-	// Write key to file with restricted permissions
-	if err := os.WriteFile(cacheFile, key, 0600); err != nil {
+	// Write encrypted key to file with restricted permissions
+	if err := os.WriteFile(cacheFile, ciphertext, 0600); err != nil {
 		return fmt.Errorf("failed to write cache file: %w", err)
 	}
 
+	fmt.Printf("[scryptcache] ✅ Encrypted and cached key to: %s\n", cacheFile)
 	return nil
 }
 
@@ -140,7 +331,7 @@ func saveCachedKey(cacheFile string, key []byte) error {
 // a byte slice of length keyLen that can be used as cryptographic key.
 //
 // This is a drop-in replacement for golang.org/x/crypto/scrypt.Key that adds
-// disk-based caching to avoid repeated expensive key derivation.
+// encrypted disk-based caching to avoid repeated expensive key derivation.
 //
 // In slim build mode (FPE), this will ONLY load cached keys and return an error
 // if no cache exists, preventing the 32MB scrypt memory spike that would crash
@@ -154,21 +345,119 @@ func Key(password, salt []byte, N, r, p, keyLen int) ([]byte, error) {
 	}
 
 	// No cached key found
-	if isSlimBuild {
-		// In slim build (FPE), we can't derive - it would crash due to memory
+	// Check if we're on macOS (path starts with /Users/) vs iOS (different sandbox path)
+	// macOS has no 20MB memory limit, so we can derive keys even in slim build
+	cacheDirMu.RLock()
+	currentDir := cacheDir
+	cacheDirMu.RUnlock()
+	isMacOS := strings.HasPrefix(currentDir, "/Users/")
+
+	if isSlimBuild && !isMacOS {
+		// In slim build (FPE) on iOS, we can't derive - it would crash due to 20MB memory limit
+		fmt.Println("[scryptcache] ❌ No cached key found and running in SLIM mode on iOS - cannot derive")
 		return nil, fmt.Errorf("SCRYPT_CACHE_MISS: Encryption key not cached. Please open Enter Space app first to initialize this encrypted remote")
+	}
+	if isSlimBuild && isMacOS {
+		fmt.Println("[scryptcache] ℹ️ Running in SLIM mode but on macOS - will derive key (no memory limit)")
 	}
 
 	// Full build - derive the key using native scrypt implementation
+	fmt.Printf("[scryptcache] 🔐 Deriving scrypt key (N=%d, r=%d, p=%d, keyLen=%d)\n", N, r, p, keyLen)
 	key, err := scryptKey(password, salt, N, r, p, keyLen)
 	if err != nil {
 		return nil, err
 	}
 
 	// Cache the derived key for future use (especially by FPE)
-	_ = saveCachedKey(cacheFile, key)
+	if err := saveCachedKey(cacheFile, key); err != nil {
+		fmt.Printf("[scryptcache] ⚠️ Failed to cache key: %v\n", err)
+		// Don't fail - the key derivation succeeded
+	}
 
 	return key, nil
+}
+
+// ReencryptAllCaches re-encrypts all cached scrypt keys from old password to new password.
+// This should be called when the shared app password rotates.
+// Returns the number of files re-encrypted and any error.
+func ReencryptAllCaches(oldPassword, newPassword string) (int, error) {
+	cacheDirMu.RLock()
+	dir := cacheDir
+	cacheDirMu.RUnlock()
+
+	if dir == "" {
+		return 0, fmt.Errorf("cache directory not set")
+	}
+
+	cacheSubDir := filepath.Join(dir, "scrypt_cache")
+	if _, err := os.Stat(cacheSubDir); os.IsNotExist(err) {
+		// No cache directory, nothing to re-encrypt
+		fmt.Println("[scryptcache] 📁 No scrypt cache directory exists, skipping re-encryption")
+		return 0, nil
+	}
+
+	fmt.Printf("[scryptcache] 🔄 Starting re-encryption of scrypt cache from %s\n", cacheSubDir)
+
+	entries, err := os.ReadDir(cacheSubDir)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read cache directory: %w", err)
+	}
+
+	reencryptedCount := 0
+	failedCount := 0
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".key") {
+			continue
+		}
+
+		filePath := filepath.Join(cacheSubDir, entry.Name())
+
+		// Read encrypted data
+		ciphertext, err := os.ReadFile(filePath)
+		if err != nil {
+			fmt.Printf("[scryptcache] ⚠️ Failed to read %s: %v\n", entry.Name(), err)
+			failedCount++
+			continue
+		}
+
+		// Decrypt with old password
+		plaintext, err := decryptData(ciphertext, oldPassword)
+		if err != nil {
+			fmt.Printf("[scryptcache] ⚠️ Failed to decrypt %s (stale?): %v\n", entry.Name(), err)
+			// Remove stale file that can't be decrypted
+			os.Remove(filePath)
+			failedCount++
+			continue
+		}
+
+		// Re-encrypt with new password
+		newCiphertext, err := encryptData(plaintext, newPassword)
+		if err != nil {
+			fmt.Printf("[scryptcache] ⚠️ Failed to re-encrypt %s: %v\n", entry.Name(), err)
+			failedCount++
+			continue
+		}
+
+		// Write back
+		if err := os.WriteFile(filePath, newCiphertext, 0600); err != nil {
+			fmt.Printf("[scryptcache] ⚠️ Failed to write %s: %v\n", entry.Name(), err)
+			failedCount++
+			continue
+		}
+
+		reencryptedCount++
+	}
+
+	fmt.Printf("[scryptcache] ✅ Re-encryption complete: %d files re-encrypted, %d files failed/removed\n",
+		reencryptedCount, failedCount)
+
+	// CRITICAL: Update the in-memory encryption password to the new password
+	// This ensures future key derivations and cache reads use the new password
+	SetEncryptionPassword(newPassword)
+	fmt.Printf("[scryptcache] 🔐 Encryption password updated to new value after re-encryption\n")
+
+	return reencryptedCount, nil
 }
 
 // scryptKey is our local implementation of scrypt key derivation.
