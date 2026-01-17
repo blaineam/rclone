@@ -30,7 +30,34 @@ import (
 var (
 	// templateString is the template used in the authorization webserver
 	templateString string
+
+	// pendingAuthURL stores the current OAuth auth URL for mobile apps to retrieve
+	// This is set when OAuth flow starts and cleared when it completes
+	pendingAuthURL   string
+	pendingAuthMutex sync.RWMutex
 )
+
+// GetPendingAuthURL returns the current pending OAuth auth URL
+// Returns empty string if no OAuth flow is in progress
+func GetPendingAuthURL() string {
+	pendingAuthMutex.RLock()
+	defer pendingAuthMutex.RUnlock()
+	return pendingAuthURL
+}
+
+// SetPendingAuthURL stores the OAuth auth URL for mobile apps to retrieve
+func SetPendingAuthURL(url string) {
+	pendingAuthMutex.Lock()
+	defer pendingAuthMutex.Unlock()
+	pendingAuthURL = url
+}
+
+// ClearPendingAuthURL clears the pending auth URL
+func ClearPendingAuthURL() {
+	pendingAuthMutex.Lock()
+	defer pendingAuthMutex.Unlock()
+	pendingAuthURL = ""
+}
 
 const (
 	// TitleBarRedirectURL is the OAuth2 redirect URL to use when the authorization
@@ -857,6 +884,10 @@ func configSetup(ctx context.Context, id, name string, m configmap.Mapper, oauth
 	go server.Serve()
 	defer server.Stop()
 	authURL = "http://" + bindAddress + "/auth?state=" + state
+
+	// Store auth URL for mobile apps to retrieve via GetPendingAuthURL()
+	SetPendingAuthURL(authURL)
+	defer ClearPendingAuthURL()
 
 	if !authorizeNoAutoBrowser {
 		// Open the URL for the user to visit
