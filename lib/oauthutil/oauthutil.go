@@ -35,6 +35,11 @@ var (
 	// This is set when OAuth flow starts and cleared when it completes
 	pendingAuthURL   string
 	pendingAuthMutex sync.RWMutex
+
+	// pendingAuthServer stores the current OAuth server for cancellation support
+	// This allows mobile apps to cancel an in-progress OAuth flow
+	pendingAuthServer      *authServer
+	pendingAuthServerMutex sync.Mutex
 )
 
 // GetPendingAuthURL returns the current pending OAuth auth URL
@@ -57,6 +62,59 @@ func ClearPendingAuthURL() {
 	pendingAuthMutex.Lock()
 	defer pendingAuthMutex.Unlock()
 	pendingAuthURL = ""
+}
+
+// setPendingAuthServer stores the current auth server for cancellation
+func setPendingAuthServer(server *authServer) {
+	pendingAuthServerMutex.Lock()
+	defer pendingAuthServerMutex.Unlock()
+	pendingAuthServer = server
+}
+
+// clearPendingAuthServer clears the stored auth server reference
+func clearPendingAuthServer() {
+	pendingAuthServerMutex.Lock()
+	defer pendingAuthServerMutex.Unlock()
+	pendingAuthServer = nil
+}
+
+// CancelPendingAuth cancels any in-progress OAuth flow by stopping the auth server
+// This should be called when the user dismisses the OAuth browser/webview
+// Returns true if an auth flow was cancelled, false if none was in progress
+func CancelPendingAuth() bool {
+	pendingAuthServerMutex.Lock()
+	server := pendingAuthServer
+	pendingAuthServer = nil
+	pendingAuthServerMutex.Unlock()
+
+	if server == nil {
+		fs.Debugf(nil, "CancelPendingAuth: No auth server to cancel")
+		return false
+	}
+
+	fs.Logf(nil, "Cancelling pending OAuth flow")
+
+	// Send a cancelled result to unblock the waiting goroutine
+	// Use a non-blocking send in case the channel is already closed or full
+	select {
+	case server.result <- &AuthResult{
+		Name:        "Cancelled",
+		Description: "OAuth flow was cancelled by user",
+		OK:          false,
+	}:
+		fs.Debugf(nil, "Sent cancellation result to auth server")
+	default:
+		fs.Debugf(nil, "Could not send cancellation result (channel full or closed)")
+	}
+
+	// Stop the server to release the port
+	server.Stop()
+
+	// Clear the pending auth URL
+	ClearPendingAuthURL()
+
+	fs.Logf(nil, "OAuth flow cancelled and port released")
+	return true
 }
 
 const (
@@ -884,6 +942,10 @@ func configSetup(ctx context.Context, id, name string, m configmap.Mapper, oauth
 	go server.Serve()
 	defer server.Stop()
 	authURL = "http://" + bindAddress + "/auth?state=" + state
+
+	// Store server reference for cancellation support
+	setPendingAuthServer(server)
+	defer clearPendingAuthServer()
 
 	// Store auth URL for mobile apps to retrieve via GetPendingAuthURL()
 	SetPendingAuthURL(authURL)
