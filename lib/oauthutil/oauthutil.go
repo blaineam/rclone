@@ -971,6 +971,11 @@ func configSetup(ctx context.Context, id, name string, m configmap.Mapper, oauth
 		return "", auth
 	}
 	fs.Logf(nil, "Got code\n")
+
+	// Clear the pending auth URL immediately so mobile apps know OAuth is complete
+	// This allows ASWebAuthenticationSession to be dismissed before drive selection
+	ClearPendingAuthURL()
+
 	if opt.CheckAuth != nil {
 		err = opt.CheckAuth(oauthConfig, auth)
 		if err != nil {
