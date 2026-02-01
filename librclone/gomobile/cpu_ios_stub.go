@@ -1,11 +1,12 @@
 //go:build ios && arm64
+// +build ios,arm64
 
 // cpu_ios_stub.go provides a stub implementation of internal/cpu.sysctlEnabled for iOS.
 // This is needed because storj.io/common uses //go:linkname to access this function,
 // but it only exists in Go's internal/cpu package for macOS (!ios), not iOS.
 // See: https://github.com/golang/go/issues/67401
 
-package gomobile
+package rclone
 
 import _ "unsafe"
 

@@ -226,10 +226,6 @@ This shows the current versions of rclone, Go and the OS:
 
 // Return version info
 func rcVersion(ctx context.Context, in Params) (out Params, err error) {
-	version, err := semver.NewVersion(fs.Version[1:])
-	if err != nil {
-		return nil, err
-	}
 	linking, tagString := buildinfo.GetLinkingAndTags()
 	osVersion, osKernel := buildinfo.GetOSVersion()
 	if osVersion == "" {
@@ -238,11 +234,28 @@ func rcVersion(ctx context.Context, in Params) (out Params, err error) {
 	if osKernel == "" {
 		osKernel = "unknown"
 	}
+
+	// Try to parse semver, but don't fail if it doesn't parse
+	var decomposed []int64
+	var isBeta bool
+	versionStr := fs.Version
+	if len(versionStr) > 0 && versionStr[0] == 'v' {
+		version, err := semver.NewVersion(versionStr[1:])
+		if err == nil {
+			decomposed = version.Slice()
+			isBeta = version.PreRelease != ""
+		}
+	}
+	// Fallback if semver parsing failed
+	if decomposed == nil {
+		decomposed = []int64{0, 0, 0}
+	}
+
 	out = Params{
 		"version":    fs.Version,
-		"decomposed": version.Slice(),
+		"decomposed": decomposed,
 		"isGit":      strings.HasSuffix(fs.Version, "-DEV"),
-		"isBeta":     version.PreRelease != "",
+		"isBeta":     isBeta,
 		"os":         runtime.GOOS,
 		"osVersion":  osVersion,
 		"osKernel":   osKernel,
