@@ -1008,6 +1008,7 @@ type authServer struct {
 	authURL     string
 	server      *http.Server
 	result      chan *AuthResult
+	stopOnce    sync.Once
 }
 
 // newAuthServer makes the webserver for collecting auth
@@ -1122,12 +1123,13 @@ func (s *authServer) Serve() {
 	fs.Debugf(nil, "Closed auth server with error: %v", err)
 }
 
-// Stop the auth server by closing its socket
+// Stop the auth server by closing its socket.
+// Safe to call multiple times; only the first call has effect.
 func (s *authServer) Stop() {
-	fs.Debugf(nil, "Closing auth server")
-	close(s.result)
-	_ = s.listener.Close()
-
-	// close the server
-	_ = s.server.Close()
+	s.stopOnce.Do(func() {
+		fs.Debugf(nil, "Closing auth server")
+		close(s.result)
+		_ = s.listener.Close()
+		_ = s.server.Close()
+	})
 }
