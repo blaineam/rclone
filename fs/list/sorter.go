@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -144,14 +145,25 @@ func (ls *Sorter) startExtSort() (err error) {
 		ChanBuffSize:       1024,      // small effect
 		SortedChanBuffSize: 1024,      // makes a lot of difference
 		ChunkSize:          32 * 1024, // tuned for 50 char records (UUID sized)
-		// Defaults
-		// ChunkSize:          int(1e6),	// amount of records to store in each chunk which will be written to disk
-		// NumWorkers:         2,		// maximum number of workers to use for parallel sorting
-		// ChanBuffSize:       1,		// buffer size for merging chunks
-		// SortedChanBuffSize: 10,		// buffer size for passing records to output
-		// TempFilesDir:       "",		// empty for use OS default ex: /tmp
+		// Use os.TempDir() explicitly so mobile platforms (iOS/Android) get
+		// the correct sandbox-writable temp path rather than falling through
+		// platform detection logic that doesn't handle all GOOS values.
+		TempFilesDir: os.TempDir(),
 	}
 	ls.sorter, ls.outputChan, ls.errChan = extsort.Strings(ls.inputChan, &opt)
+	if ls.sorter == nil {
+		// extsort.Strings returns nil when temp-file initialisation fails;
+		// the error is already queued in ls.errChan.
+		var initErr error
+		select {
+		case initErr = <-ls.errChan:
+		default:
+		}
+		if initErr == nil {
+			initErr = fmt.Errorf("sorter: failed to initialise external sort (nil sorter)")
+		}
+		return fmt.Errorf("sorter: failed to initialise external sort: %w", initErr)
+	}
 	go ls.sorter.Sort(ls.ctx)
 
 	// Show we are extsorting now
