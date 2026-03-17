@@ -1370,6 +1370,23 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		return o.openTranslatedLink(offset, limit)
 	}
 
+	// iCloud Drive materialization: if the file is an evicted iCloud stub,
+	// download it from iCloud before attempting to read. After the read
+	// completes (on Close), evict it again to free local storage.
+	var wasEvicted bool
+	if iCloudMaterializeEnabled() && isICloudEvicted(o.path) {
+		wasEvicted = true
+		timeout := iCloudMaterializeTimeout()
+		fs.Infof(o, "iCloud: materializing evicted file (timeout %v)", timeout)
+		if mErr := materializeICloudFile(o.path, timeout); mErr != nil {
+			return nil, fmt.Errorf("iCloud materialization failed for %s: %w", o.path, mErr)
+		}
+		// Re-stat to pick up the real file size after materialization
+		if sErr := o.lstat(); sErr != nil {
+			fs.Debugf(o, "iCloud: re-stat after materialize failed: %v", sErr)
+		}
+	}
+
 	fd, err := file.Open(o.path)
 	if err != nil {
 		return
@@ -1378,21 +1395,30 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	if offset != 0 {
 		// seek the object
 		_, err = fd.Seek(offset, io.SeekStart)
+		if wasEvicted {
+			return &icloudEvictOnClose{ReadCloser: wrappedFd, path: o.path}, err
+		}
 		// don't attempt to make checksums
 		return wrappedFd, err
 	}
 	if hasher == nil {
+		if wasEvicted {
+			return &icloudEvictOnClose{ReadCloser: wrappedFd, path: o.path}, nil
+		}
 		// no need to wrap since we don't need checksums
 		return wrappedFd, nil
 	}
 	// Update the hashes as we go along
-	in = &localOpenFile{
+	hashReader := &localOpenFile{
 		o:    o,
 		in:   wrappedFd,
 		hash: hasher,
 		fd:   fd,
 	}
-	return in, nil
+	if wasEvicted {
+		return &icloudEvictOnClose{ReadCloser: hashReader, path: o.path}, nil
+	}
+	return hashReader, nil
 }
 
 // mkdirAll makes all the directories needed to store the object
