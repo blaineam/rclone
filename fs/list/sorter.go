@@ -51,6 +51,7 @@ type Sorter struct {
 	errChan    <-chan error          // for getting errors from the ext sort
 	sorter     *extsort.StringSorter // external string sort
 	errs       *errcount.ErrCount    // accumulate errors
+	tempDir    string                // directory for temp files (empty for default)
 }
 
 // KeyFn turns an entry into a sort key
@@ -152,17 +153,15 @@ func (ls *Sorter) startExtSort() (err error) {
 	}
 	ls.sorter, ls.outputChan, ls.errChan = extsort.Strings(ls.inputChan, &opt)
 	if ls.sorter == nil {
-		// extsort.Strings returns nil when temp-file initialisation fails;
-		// the error is already queued in ls.errChan.
-		var initErr error
+		// extsort.Strings returns nil when it can't create temp
+		// files (e.g. due to permissions or apparmor restrictions).
+		// The error will be on errChan.
 		select {
-		case initErr = <-ls.errChan:
+		case err = <-ls.errChan:
 		default:
+			err = errors.New("failed to initialise on-disk sort")
 		}
-		if initErr == nil {
-			initErr = fmt.Errorf("sorter: failed to initialise external sort (nil sorter)")
-		}
-		return fmt.Errorf("sorter: failed to initialise external sort: %w", initErr)
+		return fmt.Errorf("sorter: %w", err)
 	}
 	go ls.sorter.Sort(ls.ctx)
 
