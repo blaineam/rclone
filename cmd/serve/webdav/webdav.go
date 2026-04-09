@@ -49,6 +49,10 @@ var OptionsInfo = fs.Options{{
 	Name:    "disable_zip",
 	Default: false,
 	Help:    "Disable zip download of directories",
+}, {
+	Name:    "display_name",
+	Default: "",
+	Help:    "Volume display name reported via DAV:displayname (shown in Finder on macOS)",
 }}.
 	Add(libhttp.ConfigInfo).
 	Add(libhttp.AuthConfigInfo).
@@ -62,6 +66,7 @@ type Options struct {
 	EtagHash       string `config:"etag_hash"`
 	DisableDirList bool   `config:"disable_dir_list"`
 	DisableZip     bool   `config:"disable_zip"`
+	DisplayName    string `config:"display_name"`
 }
 
 // Opt is options set by command line flags
@@ -221,6 +226,7 @@ type WebDAV struct {
 	proxy         *proxy.Proxy
 	ctx           context.Context // for global config
 	etagHashType  hash.Type
+	displayName   string
 }
 
 // check interface
@@ -233,6 +239,7 @@ func newWebDAV(ctx context.Context, f fs.Fs, opt *Options, vfsOpt *vfscommon.Opt
 		ctx:          ctx,
 		opt:          *opt,
 		etagHashType: hash.None,
+		displayName:  opt.DisplayName,
 	}
 	if opt.EtagHash == "auto" {
 		w.etagHashType = f.Hashes().GetOne()
@@ -588,6 +595,16 @@ func (h Handle) DeadProps() (map[xml.Name]webdav.Property, error) {
 		property   webdav.Property
 		properties = make(map[xml.Name]webdav.Property)
 	)
+	// Inject DAV:displayname for the root so macOS mounts the volume with
+	// the configured name instead of falling back to "127.0.0.1".
+	if h.w.displayName != "" && h.Handle.Node().Path() == "" {
+		xmlName = xml.Name{Space: "DAV:", Local: "displayname"}
+		property = webdav.Property{
+			XMLName:  xmlName,
+			InnerXML: []byte(h.w.displayName),
+		}
+		properties[xmlName] = property
+	}
 	if h.w.etagHashType != hash.None {
 		entry := h.Handle.Node().DirEntry()
 		if o, ok := entry.(fs.Object); ok {

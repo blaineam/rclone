@@ -45,6 +45,11 @@ func NewServer(ctx context.Context, vfs *vfs.VFS, opt *Options) (s *Server, err 
 	if err != nil {
 		return nil, fmt.Errorf("failed to open listening socket: %w", err)
 	}
+	// Register with local rpcbind so macOS NFS clients can discover us via portmapper.
+	// Both NFS (100003) and Mount (100005) programs are served on the same port by go-nfs.
+	if tcpAddr, ok := s.listener.Addr().(*net.TCPAddr); ok {
+		tryRegisterPortmapper(tcpAddr.Port)
+	}
 	return s, nil
 }
 
