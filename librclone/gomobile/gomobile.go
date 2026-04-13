@@ -8,8 +8,11 @@ import (
 	"github.com/rclone/rclone/librclone/librclone"
 	"github.com/rclone/rclone/librclone/vfsbridge"
 
-	_ "github.com/rclone/rclone/backend/all" // import all backends
-	_ "github.com/rclone/rclone/lib/plugin"  // import plugins
+	// Backend imports are handled by rclone_direct.go (copied from rclone.go
+	// at build time) which selectively imports only Tier 1-3 backends.
+	// Do NOT import backend/all here — it pulls in all 73 backends and
+	// negates the selective imports used to reduce binary size.
+	_ "github.com/rclone/rclone/lib/plugin" // import plugins
 
 	_ "golang.org/x/mobile/event/key" // make go.mod add this as a dependency
 )
