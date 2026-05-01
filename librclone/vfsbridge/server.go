@@ -69,7 +69,7 @@ func (s *Server) AddRemote(remoteName string) (retErr error) {
 	opt.PollInterval = fs.Duration(1 * time.Minute)
 	opt.ReadAhead = 128 * fs.SizeSuffix(1024)
 
-	v := vfs.New(f, &opt)
+	v := vfs.New(context.Background(), f, &opt)
 	s.vfses[remoteName] = v
 
 	fs.Infof(nil, "VFS bridge: added remote %q", remoteName)

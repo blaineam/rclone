@@ -146,10 +146,16 @@ func (ls *Sorter) startExtSort() (err error) {
 		ChanBuffSize:       1024,      // small effect
 		SortedChanBuffSize: 1024,      // makes a lot of difference
 		ChunkSize:          32 * 1024, // tuned for 50 char records (UUID sized)
-		// Use os.TempDir() explicitly so mobile platforms (iOS/Android) get
-		// the correct sandbox-writable temp path rather than falling through
-		// platform detection logic that doesn't handle all GOOS values.
-		TempFilesDir: os.TempDir(),
+		// Prefer the explicit per-Sorter tempDir if the caller set one,
+		// otherwise fall back to os.TempDir(). Hard-coding os.TempDir()
+		// here is the iOS/Android safety net: mobile sandboxes don't
+		// accept the various platform-default paths extsort would pick.
+		TempFilesDir: func() string {
+			if ls.tempDir != "" {
+				return ls.tempDir
+			}
+			return os.TempDir()
+		}(),
 	}
 	ls.sorter, ls.outputChan, ls.errChan = extsort.Strings(ls.inputChan, &opt)
 	if ls.sorter == nil {
