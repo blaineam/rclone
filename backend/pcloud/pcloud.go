@@ -601,6 +601,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, fi
 		opts.Parameters.Set("recursive", "1")
 	}
 	opts.Parameters.Set("folderid", dirIDtoNumber(dirID))
+	opts.Parameters.Set("showhashs", "1")
 
 	var result api.ItemResult
 	var resp *http.Response
@@ -1317,6 +1318,17 @@ func (o *Object) setMetaData(info *api.Item) (err error) {
 	o.size = info.Size
 	o.modTime = info.ModTime()
 	o.id = info.ID
+	// Populate hashes from listing data (when showhashs=1 is used) to
+	// avoid per-file /checksumfile API calls during hash comparison.
+	if info.SHA1 != "" {
+		o.sha1 = info.SHA1
+	}
+	if info.MD5 != "" {
+		o.md5 = info.MD5
+	}
+	if info.SHA256 != "" {
+		o.sha256 = info.SHA256
+	}
 	return nil
 }
 
