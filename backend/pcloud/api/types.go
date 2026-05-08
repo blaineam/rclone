@@ -84,10 +84,6 @@ type Item struct {
 	Category       int    `json:"category,omitempty"`
 	Size           int64  `json:"size,omitempty"`
 	ContentType    string `json:"contenttype,omitempty"`
-	// File content hashes — populated when listfolder is called with showhashs=1
-	SHA1           string `json:"sha1,omitempty"`
-	MD5            string `json:"md5,omitempty"`
-	SHA256         string `json:"sha256,omitempty"`
 	Contents       []Item `json:"contents"`
 }
 
