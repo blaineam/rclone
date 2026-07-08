@@ -105,7 +105,12 @@ var (
 			"files.content.read",
 			"sharing.write",
 			"account_info.read", // needed for About
-			// "file_requests.write",
+			// Enter Space: needed for native Dropbox File Requests. The
+			// rclone app registration permits this scope (verified against
+			// the authorize endpoint); upstream just never requests it.
+			// Tokens minted before this change lack it — a one-time
+			// re-authentication of the remote picks it up.
+			"file_requests.write",
 			// "members.read", // needed for impersonate - but causes app to need to be approved by Dropbox Team Admin during the flow
 			// "team_data.member"
 		},
