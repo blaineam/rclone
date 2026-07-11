@@ -34,6 +34,8 @@ import (
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/random"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -502,7 +504,9 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (string, bool, e
 		return "", false, err
 	}
 	for _, e := range entries {
-		if f.opt.Encoding.ToStandardName(e.PlainName) == leaf {
+		// Compare Unicode normalization insensitively - Apple clients
+		// send NFD names while the server stores NFC (or vice versa)
+		if dircache.NameEqual(f.opt.Encoding.ToStandardName(e.PlainName), leaf) {
 			return e.UUID, true, nil
 		}
 	}
@@ -538,9 +542,41 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (string, error)
 	return resp.UUID, nil
 }
 
+// normVariants returns name followed by any distinct Unicode
+// normalization forms (NFC, NFD) of it
+func normVariants(name string) []string {
+	variants := []string{name}
+	for _, alt := range []string{norm.NFC.String(name), norm.NFD.String(name)} {
+		if alt != name {
+			variants = append(variants, alt)
+		}
+	}
+	return variants
+}
+
 // preUploadCheck checks if a file exists in the given directory
 // Returns the file metadata if it exists, nil if not
+//
+// The check is retried with alternate Unicode normalization forms of
+// the name - the server-side existence check matches byte-wise, so an
+// NFD name from an Apple client would otherwise miss an existing NFC
+// file (or vice versa) and create a duplicate.
 func (f *Fs) preUploadCheck(ctx context.Context, leaf, directoryID string) (*folders.File, error) {
+	for _, name := range normVariants(leaf) {
+		file, err := f.preUploadCheckOne(ctx, name, directoryID)
+		if err != nil {
+			return nil, err
+		}
+		if file != nil {
+			return file, nil
+		}
+	}
+	return nil, nil
+}
+
+// preUploadCheckOne checks if a file with exactly this name exists in
+// the given directory
+func (f *Fs) preUploadCheckOne(ctx context.Context, leaf, directoryID string) (*folders.File, error) {
 	// Parse name and extension from the leaf
 	baseName := f.opt.Encoding.FromStandardName(leaf)
 	name := strings.TrimSuffix(baseName, path.Ext(baseName))
@@ -738,7 +774,9 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 			name += "." + e.Type
 		}
 		decodedName := f.opt.Encoding.ToStandardName(name)
-		if decodedName == targetName {
+		// Compare Unicode normalization insensitively - Apple clients
+		// send NFD names while the server stores NFC (or vice versa)
+		if dircache.NameEqual(decodedName, targetName) {
 			return newObjectWithFile(f, remote, &e), nil
 		}
 	}

@@ -297,7 +297,9 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.It
 	}
 
 	found, err := f.listAll(ctx, directoryID, false, true, leaf, func(item *api.Item) bool {
-		if item.Name == leaf {
+		// Compare Unicode normalization insensitively - Apple clients
+		// send NFD names while the server stores NFC (or vice versa)
+		if dircache.NameEqual(item.Name, leaf) {
 			info = item
 			return true
 		}
@@ -459,7 +461,9 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut string, found bool, err error) {
 	// Find the leaf in pathID
 	found, err = f.listAll(ctx, pathID, true, false, leaf, func(item *api.Item) bool {
-		if item.Name == leaf {
+		// Compare Unicode normalization insensitively - Apple clients
+		// send NFD names while the server stores NFC (or vice versa)
+		if dircache.NameEqual(item.Name, leaf) {
 			pathIDOut = item.ID.String()
 			return true
 		}

@@ -14,6 +14,8 @@ import (
 	"sync"
 
 	"github.com/rclone/rclone/fs"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // DirCache caches paths to directory IDs and vice versa
@@ -88,13 +90,39 @@ func (dc *DirCache) String() string {
 	return buf.String()
 }
 
+// normKey returns the canonical (NFC normalized) form of a cache key
+// so that alternate Unicode normalizations of the same path (eg NFD
+// paths sent by Apple clients vs NFC names returned by most servers)
+// share a single cache entry.
+//
+// Note that in the (pathological) case of two genuinely distinct
+// directory names which normalize to the same NFC form, the two paths
+// will share one cache entry and the last one stored wins.
+func normKey(path string) string {
+	return norm.NFC.String(path)
+}
+
+// NameEqual reports whether a and b are the same file or directory
+// name when compared in a Unicode normalization insensitive way.
+//
+// This should be used by backends when comparing a user supplied name
+// with names returned by the remote (eg in FindLeaf or NewObject
+// implementations) so that NFD input (as produced by Apple clients)
+// matches NFC names stored on the server and vice versa. The server's
+// original bytes should still be used for any subsequent API calls.
+func NameEqual(a, b string) bool {
+	return a == b || norm.NFC.String(a) == norm.NFC.String(b)
+}
+
 // Get a directory ID given a path
 //
 // Returns the ID and a boolean as to whether it was found or not in
 // the cache.
+//
+// The lookup is Unicode normalization insensitive.
 func (dc *DirCache) Get(path string) (id string, ok bool) {
 	dc.cacheMu.RLock()
-	id, ok = dc.cache[path]
+	id, ok = dc.cache[normKey(path)]
 	dc.cacheMu.RUnlock()
 	return id, ok
 }
@@ -111,9 +139,13 @@ func (dc *DirCache) GetInv(id string) (path string, ok bool) {
 }
 
 // Put a (path, directory ID) pair into the cache
+//
+// The cache key is stored in a Unicode normalization insensitive way,
+// but the inverse (ID to path) mapping preserves the path exactly as
+// passed in.
 func (dc *DirCache) Put(path, id string) {
 	dc.cacheMu.Lock()
-	dc.cache[path] = id
+	dc.cache[normKey(path)] = id
 	dc.invCache[id] = path
 	dc.cacheMu.Unlock()
 }
@@ -150,6 +182,9 @@ func (dc *DirCache) FlushDir(dir string) {
 		return
 	}
 	dc.cacheMu.Lock()
+
+	// Cache keys are stored NFC normalized
+	dir = normKey(dir)
 
 	// Delete the root dir
 	ID, ok := dc.cache[dir]
@@ -234,6 +269,29 @@ func (dc *DirCache) _findDir(ctx context.Context, path string, create bool) (pat
 	pathID, found, err := dc.fs.FindLeaf(ctx, parentPathID, leaf)
 	if err != nil {
 		return "", err
+	}
+
+	// If not found, retry with alternate Unicode normalization forms
+	// of the leaf. Apple clients send NFD (decomposed) names while
+	// most servers store NFC (precomposed) names or vice versa, and
+	// many backends compare names byte-wise in FindLeaf, so a name
+	// containing accents can otherwise fail to resolve even though it
+	// shows up in listings. The first form which matches wins. This
+	// also stops Mkdir (create below) making an NFC/NFD twin of an
+	// existing directory.
+	if !found && !fs.GetConfig(ctx).NoUnicodeNormalization {
+		for _, altLeaf := range []string{norm.NFC.String(leaf), norm.NFD.String(leaf)} {
+			if altLeaf == leaf {
+				continue
+			}
+			pathID, found, err = dc.fs.FindLeaf(ctx, parentPathID, altLeaf)
+			if err != nil {
+				return "", err
+			}
+			if found {
+				break
+			}
+		}
 	}
 
 	// If not found create the directory if required or return an error

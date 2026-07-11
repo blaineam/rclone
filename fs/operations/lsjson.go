@@ -13,6 +13,8 @@ import (
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/walk"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // ListJSONItem in the struct which gets marshalled for each line
@@ -333,6 +335,15 @@ func StatJSON(ctx context.Context, fsrc fs.Fs, remote string, opt *ListJSONOpt) 
 	equal := func(a, b string) bool { return a == b }
 	if fsrc.Features().CaseInsensitive {
 		equal = strings.EqualFold
+	}
+	if !fs.GetConfig(ctx).NoUnicodeNormalization {
+		// Compare in a Unicode normalization insensitive way so that
+		// NFD paths (as sent by Apple clients) match NFC names
+		// returned by the remote and vice versa.
+		byteEqual := equal
+		equal = func(a, b string) bool {
+			return byteEqual(a, b) || byteEqual(norm.NFC.String(a), norm.NFC.String(b))
+		}
 	}
 	var foundEntry fs.DirEntry
 	for _, entry := range entries {

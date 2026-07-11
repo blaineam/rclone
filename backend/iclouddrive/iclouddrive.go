@@ -107,8 +107,10 @@ func (f *Fs) findLeafItem(ctx context.Context, pathID string, leaf string) (item
 		return nil, false, err
 	}
 	for _, item := range items {
-		// iCloud returns file names in NFD Unicode normalization, so normalized to NFC for consistent comparison
-		if strings.EqualFold(norm.NFC.String(item.FullName()), leaf) {
+		// iCloud returns file names in NFD Unicode normalization while
+		// clients may send either form, so normalize BOTH sides to NFC
+		// for a consistent comparison
+		if strings.EqualFold(norm.NFC.String(item.FullName()), norm.NFC.String(leaf)) {
 			return item, true, nil
 		}
 	}
