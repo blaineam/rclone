@@ -246,6 +246,7 @@ const (
 	cENOENT    int32 = 2
 	cEIO       int32 = 5
 	cEEXIST    int32 = 17
+	cEXDEV     int32 = 18
 	cENOTDIR   int32 = 20
 	cEINVAL    int32 = 22
 	cENOSPC    int32 = 28
@@ -300,6 +301,29 @@ func (s *Server) remoteNames() []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+// isAggregateRoot reports whether id refers to the SYNTHETIC root directory --
+// the one that exists only when several remotes are exposed through a single
+// volume, and whose children are the remote names rather than any one remote's
+// contents.
+//
+// That root is not backed by a vfs.Node, so it is absent from the inode table
+// and every lookup through InodeTable.GetNode returns nil for it. Callers that
+// resolve an id straight through GetNode therefore reported ENOENT for the
+// mount's own root. doLookup and doReadDir special-cased it from the start;
+// nothing else did, and doGetAttr not doing so broke mounting outright: the
+// first thing FSKit does after activate is fetch the root's type, so a
+// two-remote volume failed at fetchAndSetTypeForItem with ENOENT before any
+// user-visible operation ran. Single-remote volumes were unaffected because
+// doActivate binds the real root node via AssignRoot in that case.
+func (s *Server) isAggregateRoot(id uint64) bool {
+	if id != RootInodeID {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.vfses) > 1
 }
 
 // handleRequest dispatches a JSON request to the appropriate VFS operation.
@@ -395,7 +419,7 @@ func (s *Server) nodeToItemInfo(node vfs.Node, id uint64) ItemInfo {
 		Name: node.Name(), IsDir: node.IsDir(),
 		Size: node.Size(), Mode: mode,
 		ModTime: node.ModTime().Unix(),
-		UID: 501, GID: 20,
+		UID:     501, GID: 20,
 	}
 }
 
@@ -406,6 +430,10 @@ func (s *Server) doGetAttr(req *Request) *Response {
 	if err := json.Unmarshal(req.Args, &args); err != nil {
 		return errorResp(req.ID, cEINVAL)
 	}
+	if s.isAggregateRoot(args.ItemID) {
+		return okResp(req.ID, s.inodes.GetOrCreateRootInfo())
+	}
+
 	node := s.inodes.GetNode(args.ItemID)
 	if node == nil {
 		return errorResp(req.ID, cENOENT)
@@ -422,6 +450,11 @@ func (s *Server) doSetAttr(req *Request) *Response {
 	if err := json.Unmarshal(req.Args, &args); err != nil {
 		return errorResp(req.ID, cEINVAL)
 	}
+	if s.isAggregateRoot(args.ItemID) {
+		// The aggregate root is synthesised, not stored anywhere.
+		return errorResp(req.ID, cEPERM)
+	}
+
 	node := s.inodes.GetNode(args.ItemID)
 	if node == nil {
 		return errorResp(req.ID, cENOENT)
@@ -497,6 +530,12 @@ func (s *Server) doCreate(req *Request) *Response {
 		return errorResp(req.ID, cEINVAL)
 	}
 
+	if s.isAggregateRoot(args.DirID) {
+		// Top-level entries ARE the remotes. Creating one here would have to
+		// mean adding a remote to rclone.conf, which is not this layer's job.
+		return errorResp(req.ID, cEPERM)
+	}
+
 	parentNode := s.inodes.GetNode(args.DirID)
 	if parentNode == nil {
 		return errorResp(req.ID, cENOENT)
@@ -541,17 +580,25 @@ func (s *Server) doRemove(req *Request) *Response {
 	if err := json.Unmarshal(req.Args, &args); err != nil {
 		return errorResp(req.ID, cEINVAL)
 	}
-	path := s.inodes.GetPath(args.ItemID)
-	if path == "" {
+	if s.isAggregateRoot(args.ItemID) {
+		return errorResp(req.ID, cEPERM)
+	}
+
+	// Resolve through the inode table to the actual vfs.Node and remove via the
+	// node itself. The previous form looked the PATH up and applied it to
+	// getFirstVFS(), which is only correct when exactly one remote is mounted.
+	// With several, paths are prefixed with the remote name and "first" is an
+	// arbitrary Go map iteration order -- so a delete inside one remote was
+	// issued against a different remote at a path that usually did not exist,
+	// and occasionally did. Node-based removal always reaches the owning VFS.
+	node := s.inodes.GetNode(args.ItemID)
+	if node == nil {
 		return errorResp(req.ID, cENOENT)
 	}
-	v := s.getFirstVFS()
-	if v == nil {
-		return errorResp(req.ID, cEIO)
-	}
-	if err := v.Remove(path); err != nil {
+	if err := node.Remove(); err != nil {
 		return errorResp(req.ID, mapVFSErr(err))
 	}
+	s.inodes.Remove(args.ItemID)
 	return okResp(req.ID, nil)
 }
 
@@ -565,13 +612,30 @@ func (s *Server) doRename(req *Request) *Response {
 	if err := json.Unmarshal(req.Args, &args); err != nil {
 		return errorResp(req.ID, cEINVAL)
 	}
-	oldPath := s.inodes.GetPath(args.SrcDirID) + "/" + args.SrcName
-	newPath := s.inodes.GetPath(args.DstDirID) + "/" + args.DstName
-	v := s.getFirstVFS()
-	if v == nil {
-		return errorResp(req.ID, cEIO)
+	if s.isAggregateRoot(args.SrcDirID) || s.isAggregateRoot(args.DstDirID) {
+		// Renaming a top-level entry would mean renaming a remote.
+		return errorResp(req.ID, cEPERM)
 	}
-	if err := v.Rename(oldPath, newPath); err != nil {
+
+	// Same correctness problem as doRemove: the old form built paths and handed
+	// them to getFirstVFS(), which silently targeted the wrong remote as soon as
+	// more than one was mounted. Resolve both directories as nodes instead.
+	srcNode := s.inodes.GetNode(args.SrcDirID)
+	dstNode := s.inodes.GetNode(args.DstDirID)
+	if srcNode == nil || dstNode == nil {
+		return errorResp(req.ID, cENOENT)
+	}
+	srcDir, ok1 := srcNode.(*vfs.Dir)
+	dstDir, ok2 := dstNode.(*vfs.Dir)
+	if !ok1 || !ok2 {
+		return errorResp(req.ID, cENOTDIR)
+	}
+	if srcDir.VFS() != dstDir.VFS() {
+		// Moving between two remotes is a copy+delete, not a rename. Report it
+		// honestly so the caller falls back rather than losing the file.
+		return errorResp(req.ID, cEXDEV)
+	}
+	if err := srcDir.Rename(args.SrcName, args.DstName, dstDir); err != nil {
 		return errorResp(req.ID, mapVFSErr(err))
 	}
 	return okResp(req.ID, nil)
@@ -633,6 +697,11 @@ func (s *Server) doOpen(req *Request) *Response {
 	}
 	if err := json.Unmarshal(req.Args, &args); err != nil {
 		return errorResp(req.ID, cEINVAL)
+	}
+
+	if s.isAggregateRoot(args.ItemID) {
+		// Directories open trivially, same as the branch below.
+		return okResp(req.ID, nil)
 	}
 
 	node := s.inodes.GetNode(args.ItemID)
