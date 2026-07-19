@@ -100,6 +100,26 @@ func (s *Server) ListenAddr() string {
 }
 
 // Stop shuts down the server and all VFS instances.
+// WaitForWriters blocks until every mounted remote has flushed its pending
+// uploads, or until timeout elapses.
+//
+// With CacheModeFull a write lands in the local cache and is uploaded
+// asynchronously, so "the handle closed" does not mean "the data is on the
+// remote". Anything that claims durability -- sync, unmount, deactivate,
+// shutdown -- has to go through here first.
+func (s *Server) WaitForWriters(timeout time.Duration) {
+	s.mu.RLock()
+	vfses := make([]*vfs.VFS, 0, len(s.vfses))
+	for _, v := range s.vfses {
+		vfses = append(vfses, v)
+	}
+	s.mu.RUnlock()
+
+	for _, v := range vfses {
+		v.WaitForWriters(timeout)
+	}
+}
+
 func (s *Server) Stop() {
 	if s.closed.Swap(true) {
 		return
@@ -107,6 +127,9 @@ func (s *Server) Stop() {
 	if s.listener != nil {
 		s.listener.Close()
 	}
+	// Flush before tearing anything down. Shutting a VFS down with uploads
+	// still queued discards them silently.
+	s.WaitForWriters(shutdownFlushTimeout)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for name, v := range s.vfses {
@@ -115,6 +138,9 @@ func (s *Server) Stop() {
 	}
 	s.vfses = make(map[string]*vfs.VFS)
 }
+
+// How long to wait for queued uploads at a durability point.
+const shutdownFlushTimeout = 30 * time.Second
 
 func (s *Server) acceptLoop() {
 	for {
@@ -352,7 +378,13 @@ func (s *Server) handleRequest(req *Request) *Response {
 		})
 	case "statfs":
 		return s.doStatFS(req)
-	case "mount", "unmount", "sync", "deactivate":
+	case "mount":
+		return okResp(req.ID, nil)
+	case "unmount", "sync", "deactivate":
+		// These are durability points. Returning ok without flushing meant a
+		// file written just before an unmount -- or before the app quit -- was
+		// reported as safely stored and then silently dropped with the cache.
+		s.WaitForWriters(shutdownFlushTimeout)
 		return okResp(req.ID, nil)
 	case "activate":
 		return s.doActivate(req)
@@ -388,13 +420,38 @@ func (s *Server) handleRequest(req *Request) *Response {
 }
 
 func (s *Server) doStatFS(req *Request) *Response {
-	v := s.getFirstVFS()
-	if v == nil {
+	// Sum across every mounted remote. The old form reported getFirstVFS()'s
+	// figures as the whole volume's, and "first" is arbitrary Go map iteration
+	// order -- so on a multi-remote volume `df` reported one randomly chosen
+	// remote's capacity, and reported a DIFFERENT one from mount to mount.
+	s.mu.RLock()
+	vfses := make([]*vfs.VFS, 0, len(s.vfses))
+	for _, v := range s.vfses {
+		vfses = append(vfses, v)
+	}
+	s.mu.RUnlock()
+
+	if len(vfses) == 0 {
 		return okResp(req.ID, StatFSInfo{})
 	}
-	total, used, free := v.Statfs()
+
+	var totalSum, usedSum, freeSum uint64
+	for _, v := range vfses {
+		total, used, free := v.Statfs()
+		// Statfs returns -1 for "unknown" on backends that cannot report it.
+		// Treat unknown as zero rather than letting it wrap to a huge uint64.
+		if total > 0 {
+			totalSum += uint64(total)
+		}
+		if used > 0 {
+			usedSum += uint64(used)
+		}
+		if free > 0 {
+			freeSum += uint64(free)
+		}
+	}
 	return okResp(req.ID, StatFSInfo{
-		TotalBytes: uint64(total), FreeBytes: uint64(free), UsedBytes: uint64(used),
+		TotalBytes: totalSum, FreeBytes: freeSum, UsedBytes: usedSum,
 	})
 }
 
@@ -548,21 +605,41 @@ func (s *Server) doCreate(req *Request) *Response {
 	parentPath := s.inodes.GetPath(args.DirID)
 	childPath := parentPath + "/" + args.Name
 
-	v := s.getFirstVFS()
-	if v == nil {
-		return errorResp(req.ID, cEIO)
-	}
-
+	// Create through the PARENT DIRECTORY NODE, not through a VFS looked up by
+	// path. The previous form built childPath -- which is prefixed with the
+	// remote name once more than one remote is mounted, e.g. "scratch/foo.txt"
+	// -- and passed it to getFirstVFS(). That VFS is an arbitrary Go map
+	// iteration order pick, and the prefixed path does not exist inside ANY
+	// remote (there is no "scratch" directory *inside* the scratch remote), so
+	// every create and mkdir inside a remote failed with ENOENT while reads,
+	// enumeration and in-place writes -- all of which are node-based -- worked
+	// fine. Worse than the ENOENT: had a directory of that name happened to
+	// exist in whichever remote came out first, the file would have been
+	// created in the WRONG remote.
+	//
+	// dir is the parent *vfs.Dir resolved from the inode table above, so it
+	// already belongs to the right VFS and takes a leaf name, not a path.
 	if args.IsDir {
-		if err := v.Mkdir(childPath, 0755); err != nil {
+		if _, err := dir.Mkdir(args.Name); err != nil {
 			return errorResp(req.ID, mapVFSErr(err))
 		}
 	} else {
-		fh, err := v.Create(childPath)
+		// Mirrors VFS.Create, which is OpenFile with these flags (vfs/vfs.go).
+		// Dir.Create only returns the File NODE -- it is not added to the
+		// directory until opened for write -- so the open/close is required to
+		// actually materialise the file, not just bookkeeping.
+		const createFlags = os.O_RDWR | os.O_CREATE | os.O_TRUNC
+		f, err := dir.Create(args.Name, createFlags)
 		if err != nil {
 			return errorResp(req.ID, mapVFSErr(err))
 		}
-		_ = fh.Close()
+		fh, err := f.Open(createFlags)
+		if err != nil {
+			return errorResp(req.ID, mapVFSErr(err))
+		}
+		if err := fh.Close(); err != nil {
+			return errorResp(req.ID, mapVFSErr(err))
+		}
 	}
 
 	child, err := dir.Stat(args.Name)
