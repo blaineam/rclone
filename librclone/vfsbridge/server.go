@@ -307,6 +307,12 @@ func mapVFSErr(err error) int32 {
 	case vfs.ENOSYS:
 		return cENOSYS
 	}
+	// EIO is the fallback for "we do not recognise this error", so on its own it
+	// tells a caller nothing and the underlying cause is discarded here -- which
+	// is where it is needed. An operation inside a remote failing EIO after ~18s
+	// looks identical whether the backend is unreachable, refusing, or timing
+	// out, and the FSKit side can only ever see the number. Say what it was.
+	fs.Errorf(nil, "VFS bridge: unmapped error -> EIO: %v", err)
 	return cEIO
 }
 
