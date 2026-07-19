@@ -537,7 +537,10 @@ func (s *Server) doLookup(req *Request) *Response {
 		return errorResp(req.ID, cEINVAL)
 	}
 
-	if args.DirID == RootInodeID && len(s.vfses) > 1 {
+	s.mu.RLock()
+	multi := len(s.vfses) > 1
+	s.mu.RUnlock()
+	if args.DirID == RootInodeID && multi {
 		s.mu.RLock()
 		v, ok := s.vfses[args.Name]
 		s.mu.RUnlock()
@@ -546,7 +549,22 @@ func (s *Server) doLookup(req *Request) *Response {
 		}
 		root, _ := v.Root()
 		childID := s.inodes.Assign(root, args.Name)
-		return okResp(req.ID, s.nodeToItemInfo(root, childID))
+		info := s.nodeToItemInfo(root, childID)
+		// The node here is the REMOTE'S OWN ROOT, whose vfs name is "/" -- not
+		// the name the caller asked for. Reporting node.Name() therefore
+		// answered "look up fskittest_a" with "found it, and it is called /".
+		//
+		// That is not a cosmetic mislabel. FSKit takes this string as the item's
+		// real on-disk name (the field exists so a volume can correct case or
+		// Unicode composition), and "/" is not a name any item can have. FSKit
+		// rejects the reply and then never completes the request -- so lookup of
+		// ANY path below a remote hung forever and, because BridgeClient
+		// serialises every operation on one socket behind one lock, the whole
+		// volume stopped answering behind it. doReadDir always set this field
+		// explicitly, which is why listing the root worked while descending
+		// into it did not.
+		info.Name = args.Name
+		return okResp(req.ID, info)
 	}
 
 	parentNode := s.inodes.GetNode(args.DirID)
