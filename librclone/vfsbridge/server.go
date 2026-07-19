@@ -4,6 +4,7 @@
 package vfsbridge
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime/pprof"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -420,6 +422,27 @@ func (s *Server) handleRequest(req *Request) *Response {
 		return s.doWrite(req)
 	case "access":
 		return okResp(req.ID, true)
+	case "debugGoroutines":
+		// Full goroutine dump, over the bridge's own channel.
+		//
+		// This exists because there was no other way to get one. The Go code
+		// runs as a gomobile c-archive inside the app, where: rclone's own
+		// fs.Infof output goes nowhere the app surfaces; SIGQUIT produces no
+		// traceback (the c-archive runtime installs no handler); and rclone's
+		// rc server does expose /debug/pprof but behind bcrypt htpasswd auth
+		// whose password lives in the Keychain. So a hang in here was
+		// unobservable by any means -- which is precisely the condition that
+		// let one survive several measurement cycles.
+		//
+		// Safe to ship: this socket is loopback-only and already exposes every
+		// file operation on every mounted remote, so stack traces add no
+		// meaningful exposure, and being able to ask a stuck volume what it is
+		// stuck on is worth far more in the field than it costs.
+		var buf bytes.Buffer
+		if p := pprof.Lookup("goroutine"); p != nil {
+			_ = p.WriteTo(&buf, 2)
+		}
+		return okResp(req.ID, buf.String())
 	default:
 		return errorResp(req.ID, cENOSYS)
 	}
