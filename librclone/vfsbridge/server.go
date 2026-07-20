@@ -732,6 +732,23 @@ func (s *Server) doRemove(req *Request) *Response {
 	if node == nil {
 		return errorResp(req.ID, cENOENT)
 	}
+	// Close our own handles on this item FIRST.
+	//
+	// rclone's Remove waits for a file's open handles to finish, so removing an
+	// item we are still holding open waits on ourselves and never returns. That
+	// is not hypothetical: recursive removal of a populated tree blocked here
+	// for over ten minutes, and because a connection processes requests in
+	// order, every later operation on it timed out behind this one.
+	//
+	// The caller is deleting the item, so any handle we hold is stale by
+	// definition. Releasing it before removing is both correct and the thing
+	// that stops the wait.
+	for _, h := range s.handles.PopAll(args.ItemID) {
+		if err := h.Close(); err != nil {
+			fs.Errorf(nil, "VFS bridge: closing handle before remove of item %d: %v",
+				args.ItemID, err)
+		}
+	}
 	if err := node.Remove(); err != nil {
 		return errorResp(req.ID, mapVFSErr(err))
 	}
