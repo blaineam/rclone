@@ -620,6 +620,19 @@ func (s *Server) doReclaim(req *Request) *Response {
 	if err := json.Unmarshal(req.Args, &args); err != nil {
 		return errorResp(req.ID, cEINVAL)
 	}
+	// Close anything still open for this item. Reclaim is where FSKit
+	// guarantees nothing references the item any more, so a handle surviving to
+	// here was never closed and never will be. Leaving it open leaves an
+	// un-uploaded file and a node that blocks any later rename onto it.
+	for _, h := range s.handles.PopAll(args.ItemID) {
+		if err := h.Close(); err != nil {
+			fs.Errorf(nil, "VFS bridge: reclaim closed a leaked handle for item %d with error: %v",
+				args.ItemID, err)
+		} else {
+			fs.Errorf(nil, "VFS bridge: reclaim closed a handle for item %d that was never closed",
+				args.ItemID)
+		}
+	}
 	s.inodes.Remove(args.ItemID)
 	return okResp(req.ID, nil)
 }
@@ -845,7 +858,7 @@ func (s *Server) doOpen(req *Request) *Response {
 	if err != nil {
 		return errorResp(req.ID, mapVFSErr(err))
 	}
-	s.handles.Put(args.ItemID, handle)
+	s.handles.Put(args.ItemID, handle, args.Write)
 	return okResp(req.ID, nil)
 }
 
@@ -856,14 +869,18 @@ func (s *Server) doClose(req *Request) *Response {
 	if err := json.Unmarshal(req.Args, &args); err != nil {
 		return errorResp(req.ID, cEINVAL)
 	}
-	handle := s.handles.Get(args.ItemID)
+	handle := s.handles.PopLast(args.ItemID)
 	if handle == nil {
 		return okResp(req.ID, nil)
 	}
+	// A close error is the filesystem's last chance to say the data did not
+	// make it. With CacheModeFull this is where the upload is queued, so
+	// swallowing it at debug level reported a durable write that never
+	// happened. Surface it.
 	if err := handle.Close(); err != nil {
-		fs.Debugf(nil, "VFS bridge: close error for item %d: %v", args.ItemID, err)
+		fs.Errorf(nil, "VFS bridge: close failed for item %d: %v", args.ItemID, err)
+		return errorResp(req.ID, mapVFSErr(err))
 	}
-	s.handles.Remove(args.ItemID)
 	return okResp(req.ID, nil)
 }
 
@@ -876,7 +893,7 @@ func (s *Server) doRead(req *Request) *Response {
 	if err := json.Unmarshal(req.Args, &args); err != nil {
 		return errorResp(req.ID, cEINVAL)
 	}
-	handle := s.handles.Get(args.ItemID)
+	handle := s.handles.GetForRead(args.ItemID)
 	if handle == nil {
 		return errorResp(req.ID, cENOENT)
 	}
@@ -897,7 +914,11 @@ func (s *Server) doWrite(req *Request) *Response {
 	if err := json.Unmarshal(req.Args, &args); err != nil {
 		return errorResp(req.ID, cEINVAL)
 	}
-	handle := s.handles.Get(args.ItemID)
+	// Must be a WRITABLE handle. When an item is open for both reading and
+	// writing, taking whichever handle was stored last could send the write to
+	// the read handle and fail — or worse, appear to succeed against the wrong
+	// one. See `HandleTable`.
+	handle := s.handles.GetForWrite(args.ItemID)
 	if handle == nil {
 		return errorResp(req.ID, cENOENT)
 	}
