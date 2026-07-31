@@ -88,6 +88,42 @@ func StartVFSBridge(remoteName string, port int) string {
 	return bridgeServer.ListenAddr()
 }
 
+// RemoveVFSBridgeRemote withdraws one remote from the running bridge, leaving
+// every other remote's VFS and cache untouched. Returns "" on success, or
+// "error: message" on failure. Removing a remote that is not exposed, or
+// calling this with no bridge running, succeeds.
+//
+// Use this rather than StopVFSBridge + a round of StartVFSBridge calls when the
+// user toggles a remote off: restarting the bridge drops every remote's cache
+// and puts each survivor through a fresh fs.NewFs, which is network I/O.
+// Exported as RcloneRemoveVFSBridgeRemote
+func RemoveVFSBridgeRemote(remoteName string) string {
+	bridgeMu.Lock()
+	server := bridgeServer
+	bridgeMu.Unlock()
+
+	if server == nil {
+		return ""
+	}
+	if err := server.RemoveRemote(remoteName); err != nil {
+		return "error: " + err.Error()
+	}
+	return ""
+}
+
+// VFSBridgeGeneration returns a counter that changes whenever the set of
+// remotes the bridge exposes changes. Zero when no bridge is running.
+// Exported as RcloneVFSBridgeGeneration
+func VFSBridgeGeneration() int64 {
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
+
+	if bridgeServer == nil {
+		return 0
+	}
+	return int64(bridgeServer.Generation())
+}
+
 // StopVFSBridge stops the VFS bridge server.
 // Exported as RcloneStopVFSBridge
 func StopVFSBridge() {

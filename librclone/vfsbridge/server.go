@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"runtime/pprof"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,16 +31,27 @@ type Server struct {
 	closed   atomic.Bool
 	inodes   *InodeTable
 	handles  *HandleTable
+	// generation counts changes to the set of exposed remotes. Every response
+	// carries it so the FSKit side can use it as the root's directory verifier
+	// and notice a remote appearing or disappearing without polling for it.
+	generation atomic.Uint64
 }
 
 // NewServer creates a new VFS bridge server.
 func NewServer() *Server {
-	return &Server{
+	s := &Server{
 		vfses:   make(map[string]*vfs.VFS),
 		inodes:  NewInodeTable(),
 		handles: NewHandleTable(),
 	}
+	// Start at 1: zero is FSDirectoryVerifierInitial on the FSKit side, which
+	// means "no verifier yet" rather than a generation the module chose.
+	s.generation.Store(1)
+	return s
 }
+
+// Generation returns the current remote-set generation.
+func (s *Server) Generation() uint64 { return s.generation.Load() }
 
 // AddRemote initializes a VFS for the given remote and adds it to the server.
 // Uses recover to prevent panics in rclone internals from crashing the host app.
@@ -79,10 +91,72 @@ func (s *Server) AddRemote(remoteName string) (retErr error) {
 
 	v := vfs.New(context.Background(), f, &opt)
 	s.vfses[remoteName] = v
+	s.generation.Add(1)
 
 	fs.Infof(nil, "VFS bridge: added remote %q", remoteName)
 	return nil
 }
+
+// RemoveRemote withdraws a remote from the volume, flushing its pending
+// uploads and releasing its VFS. Removing one that is not exposed is not an
+// error.
+//
+// This is what lets the app toggle a remote off without restarting the bridge.
+// Stopping the whole server to drop one remote takes every OTHER remote's VFS
+// and cache down with it, and forces each survivor through a fresh fs.NewFs --
+// network round trips for an auth refresh and a root listing -- on the way back
+// up.
+//
+// The flush comes first and is not optional. With CacheModeFull a write lands
+// in the local cache and uploads asynchronously, so a VFS shut down with
+// uploads still queued discards them silently: the file was acknowledged,
+// readable through the mount, and never stored.
+func (s *Server) RemoveRemote(remoteName string) (retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			retErr = fmt.Errorf("panic in RemoveRemote(%q): %v", remoteName, r)
+			fs.Errorf(nil, "VFS bridge: %v", retErr)
+		}
+	}()
+
+	s.mu.Lock()
+	v, exists := s.vfses[remoteName]
+	if !exists {
+		s.mu.Unlock()
+		return nil
+	}
+	delete(s.vfses, remoteName)
+	s.generation.Add(1)
+	s.mu.Unlock()
+
+	// Everything below runs outside s.mu: closing handles and draining uploads
+	// both block for as long as the backend takes, and holding the lock across
+	// that would stall every other remote's requests.
+	//
+	// Close first, THEN drain. A handle still open is a writer the VFS is still
+	// waiting on, so draining first means waiting out the whole timeout for
+	// writers that only this loop can release -- 30s to toggle off a remote
+	// with a file open. Closing queues the upload; the drain then has something
+	// finite to wait for.
+	for _, id := range s.inodes.RemoveSubtree(remoteName) {
+		for _, h := range s.handles.PopAll(id) {
+			if err := h.Close(); err != nil {
+				fs.Errorf(nil, "VFS bridge: closing handle on item %d of removed remote %q: %v",
+					id, remoteName, err)
+			}
+		}
+	}
+	v.WaitForWriters(removeFlushTimeout)
+	v.Shutdown()
+
+	fs.Infof(nil, "VFS bridge: removed remote %q", remoteName)
+	return nil
+}
+
+// How long removing a remote waits for its queued uploads before giving up on
+// them. Generous: this runs off the FSKit request path, and the alternative to
+// waiting is discarding a write the user was told had succeeded.
+const removeFlushTimeout = 30 * time.Second
 
 // Start begins listening on the given address. Pass "localhost:0" for random port.
 func (s *Server) Start(addr string) (string, error) {
@@ -246,6 +320,11 @@ type Response struct {
 	Ok     bool        `json:"ok"`
 	Error  int32       `json:"error,omitempty"`
 	Result interface{} `json:"result,omitempty"`
+	// Gen is the remote-set generation current when this response was built.
+	// It rides on every reply rather than living behind its own op so the FSKit
+	// side learns that a remote appeared or disappeared from traffic it was
+	// making anyway, with no polling and no extra round trip.
+	Gen uint64 `json:"gen,omitempty"`
 }
 
 // ItemInfo is the JSON representation of a file/directory.
@@ -324,15 +403,6 @@ func mapVFSErr(err error) int32 {
 	return cEIO
 }
 
-func (s *Server) getFirstVFS() *vfs.VFS {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, v := range s.vfses {
-		return v
-	}
-	return nil
-}
-
 func (s *Server) remoteNames() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -344,30 +414,40 @@ func (s *Server) remoteNames() []string {
 }
 
 // isAggregateRoot reports whether id refers to the SYNTHETIC root directory --
-// the one that exists only when several remotes are exposed through a single
-// volume, and whose children are the remote names rather than any one remote's
-// contents.
+// the volume's own root, whose children are the remote names rather than any
+// one remote's contents.
 //
 // That root is not backed by a vfs.Node, so it is absent from the inode table
 // and every lookup through InodeTable.GetNode returns nil for it. Callers that
 // resolve an id straight through GetNode therefore reported ENOENT for the
 // mount's own root. doLookup and doReadDir special-cased it from the start;
 // nothing else did, and doGetAttr not doing so broke mounting outright: the
-// first thing FSKit does after activate is fetch the root's type, so a
-// two-remote volume failed at fetchAndSetTypeForItem with ENOENT before any
-// user-visible operation ran. Single-remote volumes were unaffected because
-// doActivate binds the real root node via AssignRoot in that case.
+// first thing FSKit does after activate is fetch the root's type, so the volume
+// failed at fetchAndSetTypeForItem with ENOENT before any user-visible
+// operation ran.
+//
+// The root is synthetic REGARDLESS OF HOW MANY REMOTES ARE EXPOSED, including
+// one and none. It used to be synthetic only above one remote, with a single
+// remote's own root bound to this id instead -- which meant the identity of
+// inode 2 depended on a count that the app changes at runtime. Adding a second
+// remote to a one-remote volume, or removing the second of two, silently
+// changed what the mount's root WAS while the kernel held a vnode for it, so
+// the set of exposed remotes could only be changed by unmounting first. Keeping
+// the shape invariant is what makes AddRemote and RemoveRemote safe on a live
+// mount.
 func (s *Server) isAggregateRoot(id uint64) bool {
-	if id != RootInodeID {
-		return false
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.vfses) > 1
+	return id == RootInodeID
 }
 
-// handleRequest dispatches a JSON request to the appropriate VFS operation.
+// handleRequest dispatches a JSON request to the appropriate VFS operation,
+// stamping every reply with the remote-set generation it was answered under.
 func (s *Server) handleRequest(req *Request) *Response {
+	resp := s.dispatch(req)
+	resp.Gen = s.generation.Load()
+	return resp
+}
+
+func (s *Server) dispatch(req *Request) *Response {
 	switch req.Op {
 	case "getResourceIdentifier":
 		return okResp(req.ID, map[string]string{
@@ -491,14 +571,7 @@ func (s *Server) doStatFS(req *Request) *Response {
 }
 
 func (s *Server) doActivate(req *Request) *Response {
-	rootInfo := s.inodes.GetOrCreateRootInfo()
-	if len(s.vfses) == 1 {
-		if v := s.getFirstVFS(); v != nil {
-			r, _ := v.Root()
-			s.inodes.AssignRoot(r)
-		}
-	}
-	return okResp(req.ID, rootInfo)
+	return okResp(req.ID, s.inodes.GetOrCreateRootInfo())
 }
 
 func (s *Server) nodeToItemInfo(node vfs.Node, id uint64) ItemInfo {
@@ -572,10 +645,7 @@ func (s *Server) doLookup(req *Request) *Response {
 		return errorResp(req.ID, cEINVAL)
 	}
 
-	s.mu.RLock()
-	multi := len(s.vfses) > 1
-	s.mu.RUnlock()
-	if args.DirID == RootInodeID && multi {
+	if s.isAggregateRoot(args.DirID) {
 		s.mu.RLock()
 		v, ok := s.vfses[args.Name]
 		s.mu.RUnlock()
@@ -809,8 +879,9 @@ func (s *Server) doReadDir(req *Request) *Response {
 		return errorResp(req.ID, cEINVAL)
 	}
 
-	if args.DirID == RootInodeID && len(s.vfses) > 1 {
+	if s.isAggregateRoot(args.DirID) {
 		names := s.remoteNames()
+		sort.Strings(names) // map order is random; a listing that reshuffles is not a listing
 		entries := make([]DirEntry, 0, len(names))
 		for i, name := range names {
 			s.mu.RLock()

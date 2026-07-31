@@ -1,6 +1,7 @@
 package vfsbridge
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -72,15 +73,6 @@ func (t *InodeTable) Assign(node vfs.Node, path string) uint64 {
 	return id
 }
 
-// AssignRoot assigns a VFS node to the root inode ID.
-func (t *InodeTable) AssignRoot(node vfs.Node) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.idToNode[RootInodeID] = node
-	t.idToPath[RootInodeID] = ""
-	t.pathToID[""] = RootInodeID
-}
-
 // GetNode returns the VFS node for the given inode ID.
 func (t *InodeTable) GetNode(id uint64) vfs.Node {
 	t.mu.RLock()
@@ -117,6 +109,31 @@ func (t *InodeTable) GetParentID(id uint64) uint64 {
 	}
 
 	return RootInodeID
+}
+
+// RemoveSubtree forgets every inode belonging to the named remote -- its own
+// root and everything cached below it -- and returns their IDs so the caller
+// can close whatever is still open on them.
+//
+// Paths in this table are remote-relative with the remote name as the first
+// component ("drive", "drive/sub/file.txt"), which is what makes the subtree
+// selectable by prefix.
+func (t *InodeTable) RemoveSubtree(remote string) []uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	prefix := remote + "/"
+	removed := make([]uint64, 0)
+	for id, path := range t.idToPath {
+		if path != remote && !strings.HasPrefix(path, prefix) {
+			continue
+		}
+		removed = append(removed, id)
+		delete(t.pathToID, path)
+		delete(t.idToNode, id)
+		delete(t.idToPath, id)
+	}
+	return removed
 }
 
 // Remove removes an inode from the table.
