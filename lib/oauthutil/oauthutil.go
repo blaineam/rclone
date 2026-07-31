@@ -21,6 +21,7 @@ import (
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
+	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/skratchdot/open-golang/open"
 	"golang.org/x/oauth2"
@@ -31,91 +32,13 @@ var (
 	// templateString is the template used in the authorization webserver
 	templateString string
 
-	// pendingAuthURL stores the current OAuth auth URL for mobile apps to retrieve
-	// This is set when OAuth flow starts and cleared when it completes
-	pendingAuthURL   string
-	pendingAuthMutex sync.RWMutex
-
-	// pendingAuthServer stores the current OAuth server for cancellation support
-	// This allows mobile apps to cancel an in-progress OAuth flow
-	pendingAuthServer      *authServer
-	pendingAuthServerMutex sync.Mutex
+	// oauthCancelFn stores the cancel function for the currently active OAuth flow
+	oauthCancelFn context.CancelFunc
+	// oauthCancelMu protects oauthCancelFn and oauthURL
+	oauthCancelMu sync.Mutex
+	// oauthURL stores the URL for the currently active OAuth flow
+	oauthURL string
 )
-
-// GetPendingAuthURL returns the current pending OAuth auth URL
-// Returns empty string if no OAuth flow is in progress
-func GetPendingAuthURL() string {
-	pendingAuthMutex.RLock()
-	defer pendingAuthMutex.RUnlock()
-	return pendingAuthURL
-}
-
-// SetPendingAuthURL stores the OAuth auth URL for mobile apps to retrieve
-func SetPendingAuthURL(url string) {
-	pendingAuthMutex.Lock()
-	defer pendingAuthMutex.Unlock()
-	pendingAuthURL = url
-}
-
-// ClearPendingAuthURL clears the pending auth URL
-func ClearPendingAuthURL() {
-	pendingAuthMutex.Lock()
-	defer pendingAuthMutex.Unlock()
-	pendingAuthURL = ""
-}
-
-// setPendingAuthServer stores the current auth server for cancellation
-func setPendingAuthServer(server *authServer) {
-	pendingAuthServerMutex.Lock()
-	defer pendingAuthServerMutex.Unlock()
-	pendingAuthServer = server
-}
-
-// clearPendingAuthServer clears the stored auth server reference
-func clearPendingAuthServer() {
-	pendingAuthServerMutex.Lock()
-	defer pendingAuthServerMutex.Unlock()
-	pendingAuthServer = nil
-}
-
-// CancelPendingAuth cancels any in-progress OAuth flow by stopping the auth server
-// This should be called when the user dismisses the OAuth browser/webview
-// Returns true if an auth flow was cancelled, false if none was in progress
-func CancelPendingAuth() bool {
-	pendingAuthServerMutex.Lock()
-	server := pendingAuthServer
-	pendingAuthServer = nil
-	pendingAuthServerMutex.Unlock()
-
-	if server == nil {
-		fs.Debugf(nil, "CancelPendingAuth: No auth server to cancel")
-		return false
-	}
-
-	fs.Logf(nil, "Cancelling pending OAuth flow")
-
-	// Send a cancelled result to unblock the waiting goroutine
-	// Use a non-blocking send in case the channel is already closed or full
-	select {
-	case server.result <- &AuthResult{
-		Name:        "Cancelled",
-		Description: "OAuth flow was cancelled by user",
-		OK:          false,
-	}:
-		fs.Debugf(nil, "Sent cancellation result to auth server")
-	default:
-		fs.Debugf(nil, "Could not send cancellation result (channel full or closed)")
-	}
-
-	// Stop the server to release the port
-	server.Stop()
-
-	// Clear the pending auth URL
-	ClearPendingAuthURL()
-
-	fs.Logf(nil, "OAuth flow cancelled and port released")
-	return true
-}
 
 const (
 	// TitleBarRedirectURL is the OAuth2 redirect URL to use when the authorization
@@ -579,6 +502,25 @@ func SharedClientIDWarning(name, service, helpURL string, m configmap.Mapper) {
 	fs.Logf(name, "This remote uses rclone's shared %s client_id, which is being retired and will stop working during 2026. Create your own client_id to avoid interruption: %s", service, helpURL)
 }
 
+// SharedClientIDConfigConfirm returns a config wizard Yes/No step
+// warning that this remote would use rclone's shared client_id (which
+// is being retired) and asking whether to continue with it anyway. It
+// should only be used when the user has left client_id blank on the
+// OAuth path.
+//
+// state is the config state to go to next, service is the human
+// readable name of the service (eg "Google Drive") and helpURL points
+// at the docs describing how to make your own client_id.
+//
+// The question defaults to No to steer the user towards making their
+// own client_id.
+func SharedClientIDConfigConfirm(state, service, helpURL string) (*fs.ConfigOut, error) {
+	return fs.ConfigConfirm(state, false, "config_shared_client_id", fmt.Sprintf(`rclone's shared %s client_id is being retired and will stop working during 2026.
+Create your own to avoid interruption: %s
+
+Continue using the shared client_id anyway?`, service, helpURL))
+}
+
 // NewClientWithBaseClient gets a token from the config file and
 // configures a Client with it.  It returns the client and a
 // TokenSource which Invalidate may need to be called on.  It uses the
@@ -727,7 +669,7 @@ func ConfigOAuth(ctx context.Context, name string, m configmap.Mapper, ri *fs.Re
 		// See if already have a token
 		tokenString, ok := m.Get("token")
 		if ok && tokenString != "" {
-			return fs.ConfigConfirm(newState("*oauth-confirm"), true, "config_refresh_token", "Already have a token - refresh?")
+			return fs.ConfigConfirm(newState("*oauth-confirm"), true, "config_refresh_token", "Token already configured - replace it?")
 		}
 		return fs.ConfigGoto(newState("*oauth-confirm"))
 	case "*oauth-confirm":
@@ -774,8 +716,9 @@ version recommended):
 		// Find the overridden options
 		inM := ri.Options.NonDefault(m)
 		delete(inM, fs.ConfigToken) // delete token as we are refreshing it
+		ci := fs.GetConfig(ctx)
 		for k, v := range inM {
-			fs.Debugf(nil, "sending %s = %q", k, v)
+			fs.Debugf(nil, "sending %s = %s", k, fs.RedactOptionValue(ci, ri.Options.Get(k), v))
 		}
 		// Encode them into a string
 		mCopyString, err := inM.Encode()
@@ -806,9 +749,10 @@ version recommended):
 		}
 		// Save the config updates
 		if newFormat {
+			ci := fs.GetConfig(ctx)
 			for k, v := range outM {
 				m.Set(k, v)
-				fs.Debugf(nil, "received %s = %q", k, v)
+				fs.Debugf(nil, "received %s = %s", k, fs.RedactOptionValue(ci, ri.Options.Get(k), v))
 			}
 		} else {
 			m.Set(fs.ConfigToken, code)
@@ -871,6 +815,66 @@ version recommended):
 func init() {
 	// Set the function to avoid circular import
 	fs.ConfigOAuth = ConfigOAuth
+}
+
+func init() {
+	rc.Add(rc.Call{
+		Path:  "config/oauthstop",
+		Fn:    rcOAuthStop,
+		Title: "Stop any running OAuth authentication server.",
+		Help: `Stops the OAuth authentication server if one is running.
+
+This can be used to recover from an interrupted OAuth flow without
+restarting rclone. If no OAuth authentication is in progress, an error
+is returned.
+`,
+	})
+}
+
+func rcOAuthStop(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	oauthCancelMu.Lock()
+	defer oauthCancelMu.Unlock()
+	if oauthCancelFn == nil {
+		return nil, errors.New("no oauth authentication is in progress")
+	}
+	oauthCancelFn()
+	oauthCancelFn = nil
+	oauthURL = ""
+	return nil, nil
+}
+
+func init() {
+	rc.Add(rc.Call{
+		Path:  "config/oauthstatus",
+		Fn:    rcOAuthStatus,
+		Title: "Get the status of the OAuth authentication server.",
+		Help: `Returns the current status of the OAuth authentication server.
+
+Returns a JSON object:
+- status - "running" or "stopped"
+- authUrl - URL for the authorization (only if status is "running")
+
+Eg
+
+    {
+        "status": "running",
+        "authUrl": "http://127.0.0.1:53682/auth?state=..."
+    }
+`,
+	})
+}
+
+func rcOAuthStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	oauthCancelMu.Lock()
+	defer oauthCancelMu.Unlock()
+	status := "stopped"
+	params := rc.Params{"status": status}
+	if oauthCancelFn != nil {
+		status = "running"
+		params["status"] = status
+		params["authUrl"] = oauthURL
+	}
+	return params, nil
 }
 
 // Return true if can run without a webserver and just entering a code
@@ -957,17 +961,23 @@ func configSetup(ctx context.Context, id, name string, m configmap.Mapper, oauth
 	if err != nil {
 		return "", fmt.Errorf("failed to start auth webserver: %w", err)
 	}
-	go server.Serve()
-	defer server.Stop()
 	authURL = "http://" + bindAddress + "/auth?state=" + state
 
-	// Store server reference for cancellation support
-	setPendingAuthServer(server)
-	defer clearPendingAuthServer()
+	oauthCtx, cancel := context.WithCancel(ctx)
+	oauthCancelMu.Lock()
+	oauthCancelFn = cancel
+	oauthURL = authURL
+	oauthCancelMu.Unlock()
 
-	// Store auth URL for mobile apps to retrieve via GetPendingAuthURL()
-	SetPendingAuthURL(authURL)
-	defer ClearPendingAuthURL()
+	go server.Serve()
+	defer func() {
+		oauthCancelMu.Lock()
+		oauthCancelFn = nil
+		oauthURL = ""
+		oauthCancelMu.Unlock()
+		cancel()
+		server.Stop()
+	}()
 
 	if !authorizeNoAutoBrowser {
 		// Open the URL for the user to visit
@@ -984,16 +994,16 @@ func configSetup(ctx context.Context, id, name string, m configmap.Mapper, oauth
 
 	// Read the code via the webserver
 	fs.Logf(nil, "Waiting for code...\n")
-	auth := <-server.result
+	var auth *AuthResult
+	select {
+	case auth = <-server.result:
+	case <-oauthCtx.Done():
+		return "", errors.New("oauth authentication was cancelled")
+	}
 	if !auth.OK || auth.Code == "" {
 		return "", auth
 	}
 	fs.Logf(nil, "Got code\n")
-
-	// Clear the pending auth URL immediately so mobile apps know OAuth is complete
-	// This allows ASWebAuthenticationSession to be dismissed before drive selection
-	ClearPendingAuthURL()
-
 	if opt.CheckAuth != nil {
 		err = opt.CheckAuth(oauthConfig, auth)
 		if err != nil {
@@ -1026,7 +1036,6 @@ type authServer struct {
 	authURL     string
 	server      *http.Server
 	result      chan *AuthResult
-	stopOnce    sync.Once
 }
 
 // newAuthServer makes the webserver for collecting auth
@@ -1141,13 +1150,12 @@ func (s *authServer) Serve() {
 	fs.Debugf(nil, "Closed auth server with error: %v", err)
 }
 
-// Stop the auth server by closing its socket.
-// Safe to call multiple times; only the first call has effect.
+// Stop the auth server by closing its socket
 func (s *authServer) Stop() {
-	s.stopOnce.Do(func() {
-		fs.Debugf(nil, "Closing auth server")
-		close(s.result)
-		_ = s.listener.Close()
-		_ = s.server.Close()
-	})
+	fs.Debugf(nil, "Closing auth server")
+	close(s.result)
+	_ = s.listener.Close()
+
+	// close the server
+	_ = s.server.Close()
 }
