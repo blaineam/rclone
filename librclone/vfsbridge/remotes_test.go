@@ -137,6 +137,74 @@ func TestRemoveRemoteFlushesPendingWrite(t *testing.T) {
 	}
 }
 
+// TestReAddedRemoteKeepsItsIdentity is the readdir/lookup disagreement. Ids come
+// from a monotonic counter, so dropping the path mapping on removal meant a
+// re-added remote came back under a NEW id. FSKit takes the advertised id as
+// the item's identity, so the name appeared in the listing while every lookup
+// of it failed:
+//
+//	ls: Google: No such file or directory
+//	...
+//	FORTRESS  PCloud  PCloud Syncs  Fortified  ...
+//
+// The id a remote is exposed under must survive a remove/re-add.
+func TestReAddedRemoteKeepsItsIdentity(t *testing.T) {
+	s, _, _ := newTestServer(t)
+
+	before := remoteRootID(t, s, "rem_b")
+	if err := s.RemoveRemote("rem_b"); err != nil {
+		t.Fatalf("RemoveRemote: %v", err)
+	}
+	if err := s.AddRemote("rem_b"); err != nil {
+		t.Fatalf("AddRemote: %v", err)
+	}
+
+	// Listing must still offer it...
+	found := false
+	for _, n := range dirNames(t, s, RootInodeID) {
+		if n == "rem_b" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("re-added remote missing from the root listing")
+	}
+
+	// ...and looking it up must succeed AND return the same identity, or the
+	// vnode FSKit cached for the old id resolves to nothing.
+	after := remoteRootID(t, s, "rem_b")
+	if after != before {
+		t.Fatalf("re-added remote changed identity: id %d before, %d after — "+
+			"readdir and lookup will disagree", before, after)
+	}
+
+	// And it has to actually work through that id.
+	mustOK(t, s.handleRequest(req(t, 950, "getattr",
+		map[string]any{"itemId": after})), "getattr re-added remote")
+	mustOK(t, s.handleRequest(req(t, 951, "readdir",
+		map[string]any{"dirId": after})), "readdir re-added remote")
+}
+
+// TestRemovedRemoteResolvesENOENT checks the other half: while a remote is
+// absent its ids must resolve to nothing, even though the mapping is retained
+// so the identity can be restored.
+func TestRemovedRemoteResolvesENOENT(t *testing.T) {
+	s, _, _ := newTestServer(t)
+	id := remoteRootID(t, s, "rem_b")
+	if err := s.RemoveRemote("rem_b"); err != nil {
+		t.Fatalf("RemoveRemote: %v", err)
+	}
+	if r := s.handleRequest(req(t, 960, "getattr",
+		map[string]any{"itemId": id})); r.Ok {
+		t.Fatal("a removed remote's id still resolves")
+	}
+	for _, n := range dirNames(t, s, RootInodeID) {
+		if n == "rem_b" {
+			t.Fatal("removed remote still listed in the root")
+		}
+	}
+}
+
 // TestRemoveRemoteDropsItsInodes checks the subtree sweep: ids belonging to the
 // removed remote are forgotten, so they cannot resolve to a VFS that has been
 // shut down.

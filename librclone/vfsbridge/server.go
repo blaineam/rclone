@@ -151,7 +151,7 @@ func (s *Server) RemoveRemote(remoteName string) (retErr error) {
 	// writers that only this loop can release -- 30s to toggle off a remote
 	// with a file open. Closing queues the upload; the drain then has something
 	// finite to wait for.
-	for _, id := range s.inodes.RemoveSubtree(remoteName) {
+	for _, id := range s.inodes.UnbindSubtree(remoteName) {
 		for _, h := range s.handles.PopAll(id) {
 			if err := h.Close(); err != nil {
 				fs.Errorf(nil, "VFS bridge: closing handle on item %d of removed remote %q: %v",

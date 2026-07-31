@@ -118,29 +118,41 @@ func (t *InodeTable) GetParentID(id uint64) uint64 {
 	return RootInodeID
 }
 
-// RemoveSubtree forgets every inode belonging to the named remote -- its own
-// root and everything cached below it -- and returns their IDs so the caller
-// can close whatever is still open on them.
+// UnbindSubtree detaches every inode belonging to the named remote -- its own
+// root and everything cached below it -- from its vfs.Node, and returns their
+// IDs so the caller can close whatever is still open on them.
 //
 // Paths in this table are remote-relative with the remote name as the first
 // component ("drive", "drive/sub/file.txt"), which is what makes the subtree
 // selectable by prefix.
-func (t *InodeTable) RemoveSubtree(remote string) []uint64 {
+//
+// The path<->id mapping is deliberately KEPT. Only the node binding goes, so
+// every id in the subtree resolves to nil while the remote is absent and the
+// operations report ENOENT -- which is the right answer for a path under a
+// remote that is not currently exposed.
+//
+// Dropping the mapping instead is a bug, and a subtle one: ids come from a
+// monotonic counter and are never reissued, so a remote that was removed and
+// re-added came back under a NEW id. FSKit treats the advertised id as the
+// item's identity (see ESItem on the Swift side), so a re-added remote's name
+// appeared in readdir while every lookup of it failed ENOENT -- the directory
+// listing and the lookup disagreed about what "Google" was. Keeping the
+// mapping means a re-added remote is the same item it was before, at every
+// level of its subtree.
+func (t *InodeTable) UnbindSubtree(remote string) []uint64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	prefix := remote + "/"
-	removed := make([]uint64, 0)
+	unbound := make([]uint64, 0)
 	for id, path := range t.idToPath {
 		if path != remote && !strings.HasPrefix(path, prefix) {
 			continue
 		}
-		removed = append(removed, id)
-		delete(t.pathToID, path)
+		unbound = append(unbound, id)
 		delete(t.idToNode, id)
-		delete(t.idToPath, id)
 	}
-	return removed
+	return unbound
 }
 
 // Remove removes an inode from the table.
