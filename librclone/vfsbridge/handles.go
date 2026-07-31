@@ -83,13 +83,15 @@ func (t *HandleTable) GetForRead(itemID uint64) vfs.Handle {
 }
 
 // PopLast removes and returns the most recently opened handle for an item,
-// which is the one a matching close refers to. Returns nil when none is left.
-func (t *HandleTable) PopLast(itemID uint64) vfs.Handle {
+// which is the one a matching close refers to. Returns nil, false when none
+// is left. The bool is whether that handle was opened for writing — used by
+// doClose to decide whether to drain the writeback queue.
+func (t *HandleTable) PopLast(itemID uint64) (vfs.Handle, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	entries := t.handles[itemID]
 	if len(entries) == 0 {
-		return nil
+		return nil, false
 	}
 	last := entries[len(entries)-1]
 	if len(entries) == 1 {
@@ -97,7 +99,7 @@ func (t *HandleTable) PopLast(itemID uint64) vfs.Handle {
 	} else {
 		t.handles[itemID] = entries[:len(entries)-1]
 	}
-	return last.h
+	return last.h, last.write
 }
 
 // PopAll removes and returns every handle still open for an item.

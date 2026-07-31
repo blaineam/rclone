@@ -67,6 +67,12 @@ func (s *Server) AddRemote(remoteName string) (retErr error) {
 
 	opt := vfscommon.Opt
 	opt.CacheMode = vfscommon.CacheModeFull
+	// Flush dirty files as soon as their last handle closes, rather than
+	// waiting the default 5s write-back timer. A network volume that reports
+	// close(2) success while the bytes are still only in a local cache is
+	// lying about durability — and is exactly what the FSKit suite's
+	// create-write-read tests catch as "acknowledged but never stored".
+	opt.WriteBack = 0
 	opt.DirCacheTime = fs.Duration(5 * time.Minute)
 	opt.PollInterval = fs.Duration(1 * time.Minute)
 	opt.ReadAhead = 128 * fs.SizeSuffix(1024)
@@ -886,7 +892,7 @@ func (s *Server) doClose(req *Request) *Response {
 	if err := json.Unmarshal(req.Args, &args); err != nil {
 		return errorResp(req.ID, cEINVAL)
 	}
-	handle := s.handles.PopLast(args.ItemID)
+	handle, wasWrite := s.handles.PopLast(args.ItemID)
 	if handle == nil {
 		return okResp(req.ID, nil)
 	}
@@ -898,8 +904,19 @@ func (s *Server) doClose(req *Request) *Response {
 		fs.Errorf(nil, "VFS bridge: close failed for item %d: %v", args.ItemID, err)
 		return errorResp(req.ID, mapVFSErr(err))
 	}
+	// Closing a write handle queues the upload but does not wait for it.
+	// Drain the queue here so close(2) is actually durable. Short bound —
+	// the module's request timeout is 10s and the caller may also call sync.
+	if wasWrite {
+		s.WaitForWriters(closeFlushTimeout)
+	}
 	return okResp(req.ID, nil)
 }
+
+// How long a write-close waits for CacheModeFull writeback. Kept shorter than
+// the module's per-request timeout so a stuck upload becomes a close error
+// rather than an unattributed bridge ETIMEDOUT.
+const closeFlushTimeout = 8 * time.Second
 
 func (s *Server) doRead(req *Request) *Response {
 	var args struct {
