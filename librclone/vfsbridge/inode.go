@@ -4,7 +4,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/rclone/rclone/vfs"
 )
@@ -35,7 +34,15 @@ func NewInodeTable() *InodeTable {
 }
 
 // GetOrCreateRootInfo creates the root ItemInfo for the FSKit activate call.
-func (t *InodeTable) GetOrCreateRootInfo() ItemInfo {
+//
+// modTime is when the set of exposed remotes last changed. It must NOT be the
+// current time: the synthetic root's contents are the remote names, so its
+// modification time is meaningful only if it stays put while that set does.
+// Reporting time.Now() on every call made the root look modified on every
+// getattr, which is indistinguishable from never being modified -- a client
+// polling mtime to decide whether to re-read the directory gets noise either
+// way, and Finder never picked up a remote that had just been added.
+func (t *InodeTable) GetOrCreateRootInfo(modTime int64) ItemInfo {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -48,7 +55,7 @@ func (t *InodeTable) GetOrCreateRootInfo() ItemInfo {
 		IsDir:    true,
 		Size:     0,
 		Mode:     0755,
-		ModTime:  time.Now().Unix(),
+		ModTime:  modTime,
 		UID:      501,
 		GID:      20,
 	}

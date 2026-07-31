@@ -35,6 +35,10 @@ type Server struct {
 	// carries it so the FSKit side can use it as the root's directory verifier
 	// and notice a remote appearing or disappearing without polling for it.
 	generation atomic.Uint64
+	// rootModTime is when that set last changed, in Unix seconds, and is what
+	// the synthetic root reports as its mtime. Held separately from generation
+	// because a counter is not a timestamp and clients compare mtimes.
+	rootModTime atomic.Int64
 }
 
 // NewServer creates a new VFS bridge server.
@@ -47,7 +51,16 @@ func NewServer() *Server {
 	// Start at 1: zero is FSDirectoryVerifierInitial on the FSKit side, which
 	// means "no verifier yet" rather than a generation the module chose.
 	s.generation.Store(1)
+	s.rootModTime.Store(time.Now().Unix())
 	return s
+}
+
+// bumpRemoteSet records that the exposed remote set just changed, moving both
+// the generation the FSKit side uses as a directory verifier and the mtime the
+// synthetic root reports.
+func (s *Server) bumpRemoteSet() {
+	s.generation.Add(1)
+	s.rootModTime.Store(time.Now().Unix())
 }
 
 // Generation returns the current remote-set generation.
@@ -91,7 +104,7 @@ func (s *Server) AddRemote(remoteName string) (retErr error) {
 
 	v := vfs.New(context.Background(), f, &opt)
 	s.vfses[remoteName] = v
-	s.generation.Add(1)
+	s.bumpRemoteSet()
 
 	fs.Infof(nil, "VFS bridge: added remote %q", remoteName)
 	return nil
@@ -126,7 +139,7 @@ func (s *Server) RemoveRemote(remoteName string) (retErr error) {
 		return nil
 	}
 	delete(s.vfses, remoteName)
-	s.generation.Add(1)
+	s.bumpRemoteSet()
 	s.mu.Unlock()
 
 	// Everything below runs outside s.mu: closing handles and draining uploads
@@ -571,7 +584,7 @@ func (s *Server) doStatFS(req *Request) *Response {
 }
 
 func (s *Server) doActivate(req *Request) *Response {
-	return okResp(req.ID, s.inodes.GetOrCreateRootInfo())
+	return okResp(req.ID, s.inodes.GetOrCreateRootInfo(s.rootModTime.Load()))
 }
 
 func (s *Server) nodeToItemInfo(node vfs.Node, id uint64) ItemInfo {
@@ -596,7 +609,7 @@ func (s *Server) doGetAttr(req *Request) *Response {
 		return errorResp(req.ID, cEINVAL)
 	}
 	if s.isAggregateRoot(args.ItemID) {
-		return okResp(req.ID, s.inodes.GetOrCreateRootInfo())
+		return okResp(req.ID, s.inodes.GetOrCreateRootInfo(s.rootModTime.Load()))
 	}
 
 	node := s.inodes.GetNode(args.ItemID)

@@ -200,6 +200,47 @@ func TestGenerationMovesWithTheRemoteSet(t *testing.T) {
 	}
 }
 
+// TestRootModTimeIsStableAndMovesOnlyWithTheRemoteSet is the property a polling
+// client needs. The root used to report time.Now() on every call, so it looked
+// modified on every getattr -- which carries exactly as much information as
+// never being modified at all, and left Finder unable to notice a remote that
+// had just been added.
+func TestRootModTimeIsStableAndMovesOnlyWithTheRemoteSet(t *testing.T) {
+	s, _, _ := newTestServer(t)
+
+	rootMod := func() int64 {
+		r := mustOK(t, s.handleRequest(req(t, 900, "getattr",
+			map[string]any{"itemId": RootInodeID})), "getattr root")
+		return r.Result.(ItemInfo).ModTime
+	}
+
+	first := rootMod()
+	for i := 0; i < 5; i++ {
+		if got := rootMod(); got != first {
+			t.Fatalf("root mtime changed with no remote-set change: %d then %d", first, got)
+		}
+	}
+
+	// Unix-second resolution: without this the change would land in the same
+	// second and the assertion could not tell a real bump from a stuck value.
+	time.Sleep(1100 * time.Millisecond)
+	if err := s.RemoveRemote("rem_b"); err != nil {
+		t.Fatalf("RemoveRemote: %v", err)
+	}
+	afterRemove := rootMod()
+	if afterRemove <= first {
+		t.Fatalf("root mtime did not advance on remove: %d then %d", first, afterRemove)
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+	if err := s.AddRemote("rem_b"); err != nil {
+		t.Fatalf("AddRemote: %v", err)
+	}
+	if got := rootMod(); got <= afterRemove {
+		t.Fatalf("root mtime did not advance on add: %d then %d", afterRemove, got)
+	}
+}
+
 // TestEveryResponseCarriesTheGeneration checks the transport contract: the
 // value rides on all traffic so the FSKit side never has to poll for it.
 func TestEveryResponseCarriesTheGeneration(t *testing.T) {
