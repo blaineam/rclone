@@ -374,6 +374,7 @@ const (
 	cEEXIST    int32 = 17
 	cEXDEV     int32 = 18
 	cENOTDIR   int32 = 20
+	cEISDIR    int32 = 21
 	cEINVAL    int32 = 22
 	cENOSPC    int32 = 28
 	cEROFS     int32 = 30
@@ -1013,7 +1014,40 @@ func (s *Server) doRead(req *Request) *Response {
 	}
 	handle := s.handles.GetForRead(args.ItemID)
 	if handle == nil {
-		return errorResp(req.ID, cENOENT)
+		// A read with no registered open handle is LEGAL, and answering ENOENT
+		// for it corrupts files.
+		//
+		// The kernel's paging path issues reads that do not correspond to an
+		// FSKit open. The ordinary mmap lifecycle is open -> mmap -> close, and
+		// the mapping stays valid afterwards: every page fault from then on
+		// arrives here with the handle already popped by that close. Observed
+		// directly in a QuickLook trace -- `open, close, read` -- alongside
+		// hundreds of `-[FSVolumeConnector readFrom:...] reply:error:2` from
+		// FSKit, error 2 being the ENOENT this used to return.
+		//
+		// A reader that gets ENOENT mid-file keeps whatever it already decoded
+		// and renders the rest as garbage, which is why images came out with
+		// their first rows intact and the remainder corrupt while `cat` -- which
+		// holds its descriptor open -- read the identical file perfectly.
+		//
+		// So open one lazily and keep it in the table: reclaim already closes
+		// everything an item still holds, so its lifetime is bounded exactly as
+		// an explicitly-opened handle's is.
+		node := s.inodes.GetNode(args.ItemID)
+		if node == nil {
+			return errorResp(req.ID, cENOENT)
+		}
+		file, ok := node.(*vfs.File)
+		if !ok {
+			return errorResp(req.ID, cEISDIR)
+		}
+		h, err := file.Open(os.O_RDONLY)
+		if err != nil {
+			fs.Errorf(nil, "VFS bridge: lazy read-open of item %d failed: %v", args.ItemID, err)
+			return errorResp(req.ID, mapVFSErr(err))
+		}
+		s.handles.Put(args.ItemID, h, false)
+		handle = h
 	}
 	buf := make([]byte, args.Length)
 	n, err := handle.ReadAt(buf, args.Offset)
