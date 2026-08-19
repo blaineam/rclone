@@ -1479,24 +1479,51 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 	}
 
 	var linkRes sharing.IsSharedLinkMetadata
-	err = f.pacer.Call(func() (bool, error) {
-		linkRes, err = f.sharing.CreateSharedLinkWithSettings(&createArg)
-		return shouldRetry(ctx, err)
-	})
-
-	if err != nil && createArg.Settings.Expires != nil && strings.Contains(err.Error(), sharing.SharedLinkSettingsErrorNotAuthorized) {
-		// Some plans can't create links with expiry
-		fs.Debugf(absPath, "can't create link with expiry, trying without")
-		createArg.Settings.Expires = nil
+	createLink := func() {
 		err = f.pacer.Call(func() (bool, error) {
 			linkRes, err = f.sharing.CreateSharedLinkWithSettings(&createArg)
 			return shouldRetry(ctx, err)
 		})
 	}
+	createLink()
 
-	if err != nil && strings.Contains(err.Error(),
-		sharing.CreateSharedLinkWithSettingsErrorSharedLinkAlreadyExists) {
-		fs.Debugf(absPath, "has a public link already, attempting to retrieve it")
+	if err != nil && createArg.Settings.Expires != nil && strings.Contains(err.Error(), sharing.SharedLinkSettingsErrorNotAuthorized) {
+		// Some plans can't create links with expiry
+		fs.Debugf(absPath, "can't create link with expiry, trying without")
+		createArg.Settings.Expires = nil
+		createLink()
+	}
+
+	// An item inside an already shared folder inherits that folder's link
+	// policy, so the audience asked for above may simply not be on offer - a
+	// folder shared with named people only will not hand out a public link.
+	// Dropbox answers settings_error/invalid_settings. Give up one setting at a
+	// time until it takes, ending with none at all, which is what the web UI
+	// sends and which lets Dropbox apply the inherited policy itself.
+	relaxations := []func(s *sharing.SharedLinkSettings){
+		// deprecated, and redundant with Audience, but validated all the same
+		func(s *sharing.SharedLinkSettings) { s.RequestedVisibility = nil },
+		func(s *sharing.SharedLinkSettings) { s.Audience, s.Access = nil, nil },
+		func(s *sharing.SharedLinkSettings) { s.Expires = nil },
+	}
+	for _, relax := range relaxations {
+		if err == nil || createArg.Settings == nil || !strings.Contains(err.Error(), sharing.SharedLinkSettingsErrorInvalidSettings) {
+			break
+		}
+		relax(createArg.Settings)
+		if *createArg.Settings == (sharing.SharedLinkSettings{}) {
+			createArg.Settings = nil
+		}
+		fs.Debugf(absPath, "link settings rejected, retrying with settings %+v", createArg.Settings)
+		createLink()
+	}
+
+	// Dropbox validates the settings before it looks for an existing link, so a
+	// rejection above can also be hiding a link that is already there.
+	if err != nil && (strings.Contains(err.Error(), sharing.CreateSharedLinkWithSettingsErrorSharedLinkAlreadyExists) ||
+		strings.Contains(err.Error(), sharing.SharedLinkSettingsErrorInvalidSettings)) {
+		createErr := err
+		fs.Debugf(absPath, "couldn't create a link (%v), looking for an existing one", createErr)
 		listArg := sharing.ListSharedLinksArg{
 			Path:       absPath,
 			DirectOnly: true,
@@ -1510,7 +1537,7 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 			return
 		}
 		if len(listRes.Links) == 0 {
-			err = errors.New("sharing link already exists, but list came back empty")
+			err = createErr
 			return
 		}
 		linkRes = listRes.Links[0]
