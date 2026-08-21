@@ -39,14 +39,27 @@ type Server struct {
 	// the synthetic root reports as its mtime. Held separately from generation
 	// because a counter is not a timestamp and clients compare mtimes.
 	rootModTime atomic.Int64
+	// prefetchSlots caps how many speculative directory reads run at once.
+	// Buffered to prefetchConcurrency; a non-blocking send is the admission
+	// test, so a full buffer drops the prefetch instead of queueing it.
+	prefetchSlots chan struct{}
 }
+
+const (
+	// Per-listing cap on speculative child reads.
+	prefetchMaxChildren = 24
+	// Server-wide cap on speculative reads in flight. Small on purpose: these
+	// must never compete with the listing the user is actually waiting for.
+	prefetchConcurrency = 4
+)
 
 // NewServer creates a new VFS bridge server.
 func NewServer() *Server {
 	s := &Server{
-		vfses:   make(map[string]*vfs.VFS),
-		inodes:  NewInodeTable(),
-		handles: NewHandleTable(),
+		vfses:         make(map[string]*vfs.VFS),
+		inodes:        NewInodeTable(),
+		handles:       NewHandleTable(),
+		prefetchSlots: make(chan struct{}, prefetchConcurrency),
 	}
 	// Start at 1: zero is FSDirectoryVerifierInitial on the FSKit side, which
 	// means "no verifier yet" rather than a generation the module chose.
@@ -952,14 +965,73 @@ func (s *Server) doReadDir(req *Request) *Response {
 
 	parentPath := s.inodes.GetPath(args.DirID)
 	entries := make([]DirEntry, 0, len(items))
+	children := make([]*vfs.Dir, 0, 8)
 	for i, item := range items {
 		childPath := parentPath + "/" + item.Name()
 		childID := s.inodes.Assign(item, childPath)
 		entries = append(entries, DirEntry{
 			Item: s.nodeToItemInfo(item, childID), Cookie: uint64(i + 1),
 		})
+		if d, ok := item.(*vfs.Dir); ok {
+			children = append(children, d)
+		}
 	}
-	return okResp(req.ID, entries)
+	// Reply FIRST, warm afterwards: the caller is blocked on this response and
+	// prefetching is by definition speculative.
+	resp := okResp(req.ID, entries)
+	s.prefetchChildren(children)
+	return resp
+}
+
+// prefetchChildren warms the VFS directory cache for the subdirectories of a
+// directory that was just listed.
+//
+// WHY. Every cold listing costs one full round trip to the backend; a repeat
+// listing inside DirCacheTime costs almost nothing. Measured on a live mount:
+// 211ms-1039ms cold against ~27ms warm. Navigation is depth-first — you list a
+// folder, look at it, then open one of the folders in it — so the directory the
+// user is about to ask for is almost always one we could have fetched while
+// they were still reading the current one.
+//
+// This is deliberately ONE level deep. Recursing would turn opening a shallow
+// folder into a tree walk of the whole remote, which is the mistake that made
+// the old catalog scans hostile; and the win is nearly all in the first level,
+// because by the time the user descends we get another chance to prefetch.
+//
+// Bounded three ways, because this spends the user's egress and API quota on
+// directories they may never open:
+//   - at most prefetchMaxChildren directories per listing, so a folder with 900
+//     subdirectories does not fan out to 900 backend calls;
+//   - at most prefetchConcurrency in flight across the whole server, so a burst
+//     of listings cannot crowd out the foreground request the user is waiting
+//     on — the same reasoning as the sftp channel cap on the app side;
+//   - dropped entirely rather than queued when that budget is full. A prefetch
+//     that runs late is worthless: either the cache is already warm or the user
+//     has moved on.
+//
+// Errors are discarded on purpose. A failed prefetch is not a failed anything —
+// the foreground read will surface the real error when it happens.
+func (s *Server) prefetchChildren(children []*vfs.Dir) {
+	if len(children) > prefetchMaxChildren {
+		children = children[:prefetchMaxChildren]
+	}
+	for _, d := range children {
+		if s.closed.Load() {
+			return
+		}
+		select {
+		case s.prefetchSlots <- struct{}{}:
+		default:
+			return // budget full — drop, do not queue
+		}
+		go func(dir *vfs.Dir) {
+			defer func() { <-s.prefetchSlots }()
+			// ReadDirAll populates the same cache the foreground path reads,
+			// so a subsequent real listing is a cache hit rather than a
+			// second backend call.
+			_, _ = dir.ReadDirAll()
+		}(d)
+	}
 }
 
 func (s *Server) doOpen(req *Request) *Response {
