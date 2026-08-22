@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime/pprof"
 	"sort"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfscommon"
 )
@@ -222,8 +224,56 @@ func (s *Server) Start(addr string) (string, error) {
 	listenAddr := s.listener.Addr().String()
 	fs.Infof(nil, "VFS bridge: listening on %s", listenAddr)
 
+	purgeCachedDesktopServicesStores()
+
 	go s.acceptLoop()
 	return listenAddr, nil
+}
+
+// purgeCachedDesktopServicesStores deletes any .DS_Store the VFS cache is still
+// holding for upload.
+//
+// Refusing new ones in doCreate is only half the fix. A .DS_Store written
+// BEFORE that guard existed is already sitting in the write-back cache, and the
+// VFS retries it on every single launch — forever, because the upload fails
+// against a non-writable remote root. On the machine this was found on there
+// were ten of them, and the errors reappeared seconds after startup no matter
+// how many times the app was reinstalled. Without this, every existing user
+// keeps those errors after updating and there is nothing they can do about it.
+//
+// Both trees matter: `vfs/` holds the file data and `vfsMeta/` the write-back
+// bookkeeping that makes it a pending upload. Removing only one would leave the
+// cache internally inconsistent.
+//
+// Scoped to the exact filename, best-effort, and never fatal — a cache we
+// cannot tidy is not a reason to refuse to mount.
+func purgeCachedDesktopServicesStores() {
+	cacheDir := config.GetCacheDir()
+	if cacheDir == "" {
+		return
+	}
+	removed := 0
+	for _, sub := range []string{"vfs", "vfsMeta"} {
+		root := filepath.Join(cacheDir, sub)
+		if _, err := os.Stat(root); err != nil {
+			continue
+		}
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil // unreadable subtree: skip it, don't abort the walk
+			}
+			if d.IsDir() || !isDesktopServicesStore(d.Name()) {
+				return nil
+			}
+			if rmErr := os.Remove(path); rmErr == nil {
+				removed++
+			}
+			return nil
+		})
+	}
+	if removed > 0 {
+		fs.Infof(nil, "VFS bridge: dropped %d cached .DS_Store upload(s) — Finder scratch is never stored remotely", removed)
+	}
 }
 
 // ListenAddr returns the address the server is listening on.
