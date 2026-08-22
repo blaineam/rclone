@@ -767,6 +767,24 @@ func (s *Server) doReclaim(req *Request) *Response {
 	return okResp(req.ID, nil)
 }
 
+// isDesktopServicesStore reports whether name is Finder's per-directory view
+// state file.
+//
+// Finder writes `.DS_Store` into every directory a user so much as looks at,
+// including the root of a mounted volume. On this bridge that means uploading
+// it to the REMOTE — where, if the remote's root is not writable (an SFTP
+// account chrooted to a share list, an S3 bucket root), the create fails and
+// rclone then logs a failed partial-copy cleanup on top of it. The user sees a
+// stack of alarming errors about a file they never created and do not want
+// backed up.
+//
+// `.DS_Store` is already in `DefaultSyncExcludes.regenerable` on the Swift
+// side, but that only governs scheduled syncs; writes through the mount never
+// pass a sync filter, which is why excluding it there was not enough.
+func isDesktopServicesStore(name string) bool {
+	return name == ".DS_Store"
+}
+
 func (s *Server) doCreate(req *Request) *Response {
 	var args struct {
 		DirID uint64 `json:"dirId"`
@@ -775,6 +793,15 @@ func (s *Server) doCreate(req *Request) *Response {
 	}
 	if err := json.Unmarshal(req.Args, &args); err != nil {
 		return errorResp(req.ID, cEINVAL)
+	}
+
+	// Never persist Finder's view-state file to a remote. EPERM rather than a
+	// fake success: pretending the write worked would leave Finder believing a
+	// file exists that no later read can produce. Finder treats an unwritable
+	// `.DS_Store` as normal (it is the same answer a read-only volume gives)
+	// and silently keeps view state in memory instead.
+	if !args.IsDir && isDesktopServicesStore(args.Name) {
+		return errorResp(req.ID, cEPERM)
 	}
 
 	if s.isAggregateRoot(args.DirID) {
