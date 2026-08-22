@@ -686,6 +686,14 @@ type Fs struct {
 	sessions     atomic.Int32 // count in use sessions
 	tokens       *pacer.TokenDispenser
 	proxyURL     *url.URL // address of HTTP proxy read from environment
+	// Announce the STAT->LSTAT fallback once per remote instead of once per
+	// object. It triggers inside NewObject, so a plain log would emit a line
+	// for every file in a sync.
+	statFallbackOnce sync.Once
+	// Same, for the case where LSTAT fails too. Logged separately because a
+	// fallback that silently achieves nothing is indistinguishable from one
+	// that never ran, and that cost a whole build/install/test cycle.
+	statBothFailedOnce sync.Once
 
 	hostKeysMu sync.RWMutex
 	hostKeys   map[string][][]byte // algo -> list of trusted marshalled key bytes
@@ -2595,6 +2603,21 @@ func (o *Object) setMetadata(info os.FileInfo) {
 }
 
 // statRemote stats the file or directory at the remote given
+// statusCodeOf returns the raw SFTP status code the server sent, or 0.
+//
+// Reported in the fallback log below because the code is the only thing that
+// identifies WHICH refusal this is, and vendor SFTP servers do not stick to
+// the nine codes v3 defines — one NAS returns a code outside that range with
+// OpenSSH's own "Operation unsupported" message, which renders as "(unknown)"
+// and matches none of the exported sentinels.
+func statusCodeOf(err error) uint32 {
+	var status *sftp.StatusError
+	if errors.As(err, &status) {
+		return status.Code
+	}
+	return 0
+}
+
 func (f *Fs) stat(ctx context.Context, remote string) (info os.FileInfo, err error) {
 	absPath := remote
 	if !strings.HasPrefix(remote, "/") {
@@ -2605,6 +2628,51 @@ func (f *Fs) stat(ctx context.Context, remote string) (info os.FileInfo, err err
 		return nil, fmt.Errorf("stat: %w", err)
 	}
 	info, err = c.sftpClient.Stat(absPath)
+	if err != nil && !os.IsNotExist(err) {
+		// FALL BACK TO LSTAT WHEN THE SERVER WILL NOT ANSWER STAT.
+		//
+		// SSH_FXP_STAT and SSH_FXP_LSTAT are separate requests, and a server
+		// can serve one and refuse the other. Seen on a NAS whose sshd runs
+		// every session through a ForceCommand wrapper: readdir works, so
+		// listings are perfect, while stat is refused — and NewObject stats
+		// unconditionally, so opening ANY single file fails. Backups died in
+		// the on-disk sorter and --rc-serve returned 500, which made video
+		// playback fail with no tracks and no usable error.
+		//
+		// Deliberately NOT keyed on the status code. That server answers with
+		// OpenSSH's "Operation unsupported" text but a code outside the range
+		// SFTP v3 defines, so it equals none of pkg/sftp's exported codes and
+		// prints as "(unknown)". Matching the code would have missed it; so
+		// would matching the message, which is vendor text.
+		//
+		// Safe because it only ever converts a FAILURE into a success, and
+		// only when LSTAT genuinely works:
+		//   * not-exist is excluded above, so a broken symlink still reports
+		//     not-found rather than resolving to the dangling link
+		//   * if LSTAT fails too, STAT's original error is returned unchanged
+		//   * LSTAT differs from STAT only for symlinks, describing the link
+		//     instead of its target; rclone treats a non-regular file as
+		//     unstorable, so that degrades exactly like --sftp-skip-links
+		if lInfo, lErr := c.sftpClient.Lstat(absPath); lErr == nil {
+			// INFO, not DEBUG: without this there is no way to tell a server
+			// that needs the fallback from one that never did, and debug
+			// logging is off in normal use. Once per remote — see the field.
+			f.statFallbackOnce.Do(func() {
+				fs.Infof(f, "server refused STAT (%v, status code %d) — using LSTAT for this remote",
+					err, statusCodeOf(err))
+			})
+			info, err = lInfo, nil
+		} else {
+			// Both refused. Report BOTH codes: the codes are the only thing
+			// that says which refusal this is, and this server sends a code
+			// outside the range SFTP v3 defines, so it prints as "(unknown)"
+			// and matches no exported sentinel.
+			f.statBothFailedOnce.Do(func() {
+				fs.Infof(f, "STAT and LSTAT both failed on %q — STAT: %v (code %d); LSTAT: %v (code %d)",
+					absPath, err, statusCodeOf(err), lErr, statusCodeOf(lErr))
+			})
+		}
+	}
 	f.putSftpConnection(&c, err)
 	return info, err
 }
