@@ -17,9 +17,9 @@ import (
 // else on the interface is left nil - reaching it is a test bug, and a panic
 // says so loudly.
 type sharingStub struct {
-	sharing.Client
+	sharing.ContextClient
 
-	// one entry per CreateSharedLinkWithSettings call, nil meaning "succeed"
+	// one entry per CreateSharedLinkWithSettingsContext call, nil meaning "succeed"
 	createErrs []error
 	// the settings each call was made with, snapshotted because PublicLink
 	// edits the same struct in place between attempts
@@ -29,7 +29,7 @@ type sharingStub struct {
 	listLinks []sharing.IsSharedLinkMetadata
 }
 
-func (s *sharingStub) CreateSharedLinkWithSettings(arg *sharing.CreateSharedLinkWithSettingsArg) (sharing.IsSharedLinkMetadata, error) {
+func (s *sharingStub) CreateSharedLinkWithSettingsContext(ctx context.Context, arg *sharing.CreateSharedLinkWithSettingsArg) (sharing.IsSharedLinkMetadata, error) {
 	var snapshot *sharing.SharedLinkSettings
 	if arg.Settings != nil {
 		copied := *arg.Settings
@@ -44,7 +44,7 @@ func (s *sharingStub) CreateSharedLinkWithSettings(arg *sharing.CreateSharedLink
 	}, nil
 }
 
-func (s *sharingStub) ListSharedLinks(arg *sharing.ListSharedLinksArg) (*sharing.ListSharedLinksResult, error) {
+func (s *sharingStub) ListSharedLinksContext(ctx context.Context, arg *sharing.ListSharedLinksArg) (*sharing.ListSharedLinksResult, error) {
 	s.listCalls++
 	return &sharing.ListSharedLinksResult{Links: s.listLinks}, nil
 }
