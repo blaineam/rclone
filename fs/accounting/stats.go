@@ -28,6 +28,15 @@ const (
 // method.
 var MaxCompletedTransfers = 100
 
+// MaxErrorLog is how many error messages a StatsInfo keeps, in the order
+// they were counted, for RemoteStats to return as "errorList". `errors`
+// says how many operations failed and `lastError` shows one of them; a
+// client that wants to show its user WHICH operations failed -- and to tell
+// a permission refusal from a broken transfer -- needs the list itself.
+// Bounded so a run with a million failures cannot grow without limit; the
+// count still says how many there were.
+var MaxErrorLog = 1000
+
 // StatsInfo accounts all transfers
 // N.B.: if this struct is modified, please remember to also update sum() function in stats_groups
 // to correctly count the updated fields
@@ -37,6 +46,7 @@ type StatsInfo struct {
 	bytes                 int64
 	errors                int64
 	lastError             error
+	errorLog              []string // the first MaxErrorLog error messages, in order
 	fatalError            bool
 	retryError            bool
 	retryAfter            time.Time
@@ -122,6 +132,7 @@ func (s *StatsInfo) RemoteStats(short bool) (out rc.Params, err error) {
 	s.mu.RLock()
 	out["bytes"] = s.bytes
 	out["errors"] = s.errors
+	out["errorList"] = append([]string(nil), s.errorLog...)
 	out["fatalError"] = s.fatalError
 	out["retryError"] = s.retryError
 	out["checks"] = s.checks
@@ -715,6 +726,7 @@ func (s *StatsInfo) ResetCounters() {
 	s.bytes = 0
 	s.errors = 0
 	s.lastError = nil
+	s.errorLog = nil
 	s.fatalError = false
 	s.retryError = false
 	s.retryAfter = time.Time{}
@@ -745,6 +757,7 @@ func (s *StatsInfo) ResetErrors() {
 	defer s.mu.Unlock()
 	s.errors = 0
 	s.lastError = nil
+	s.errorLog = nil
 	s.fatalError = false
 	s.retryError = false
 	s.retryAfter = time.Time{}
@@ -766,6 +779,9 @@ func (s *StatsInfo) Error(err error) error {
 	defer s.mu.Unlock()
 	s.errors++
 	s.lastError = err
+	if len(s.errorLog) < MaxErrorLog {
+		s.errorLog = append(s.errorLog, err.Error())
+	}
 	err = fserrors.FsError(err)
 	fserrors.Count(err)
 	switch {
