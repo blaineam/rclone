@@ -23,6 +23,7 @@ import (
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfscommon"
+	"golang.org/x/text/unicode/norm"
 )
 
 // Server manages a TCP server bridging JSON requests to rclone VFS.
@@ -788,9 +789,29 @@ func (s *Server) doLookup(req *Request) *Response {
 	if err != nil {
 		return errorResp(req.ID, mapVFSErr(err))
 	}
-	childPath := s.inodes.GetPath(args.DirID) + "/" + args.Name
+	// Stat matches names Unicode normalization insensitively, and macOS looks
+	// names up in NFD while remotes mostly list NFC. Key the inode on the name
+	// as stored, the same key doReadDir uses, so both hand out one identity.
+	childPath := s.inodes.GetPath(args.DirID) + "/" + child.Name()
 	childID := s.inodes.Assign(child, childPath)
 	return okResp(req.ID, s.nodeToItemInfo(child, childID))
+}
+
+// storedName returns the name a new entry called name in dir should be
+// written under: the spelling of an existing entry it matches, otherwise name
+// in NFC.
+//
+// macOS hands file systems NFD names while most remotes store NFC, so writing
+// the caller's bytes would create an NFC/NFD twin of an existing entry, or a
+// decomposed name that other clients of the remote do not match.
+func storedName(dir *vfs.Dir, name string) string {
+	if node, err := dir.Stat(name); err == nil {
+		return node.Name()
+	}
+	if fs.GetConfig(context.Background()).NoUnicodeNormalization {
+		return name
+	}
+	return norm.NFC.String(name)
 }
 
 func (s *Server) doReclaim(req *Request) *Response {
@@ -869,6 +890,7 @@ func (s *Server) doCreate(req *Request) *Response {
 		return errorResp(req.ID, cENOTDIR)
 	}
 
+	args.Name = storedName(dir, args.Name)
 	parentPath := s.inodes.GetPath(args.DirID)
 	childPath := parentPath + "/" + args.Name
 
@@ -996,7 +1018,7 @@ func (s *Server) doRename(req *Request) *Response {
 		// honestly so the caller falls back rather than losing the file.
 		return errorResp(req.ID, cEXDEV)
 	}
-	if err := srcDir.Rename(args.SrcName, args.DstName, dstDir); err != nil {
+	if err := srcDir.Rename(args.SrcName, storedName(dstDir, args.DstName), dstDir); err != nil {
 		return errorResp(req.ID, mapVFSErr(err))
 	}
 	return okResp(req.ID, nil)
