@@ -2,6 +2,7 @@ package accounting
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"testing"
@@ -271,6 +272,64 @@ func TestRemoteStats(t *testing.T) {
 		assert.Equal(t, float64(10), rs["transferTime"])
 		assert.Greater(t, rs["elapsedTime"], float64(0))
 	})
+}
+
+func TestRemoteStatsErrorList(t *testing.T) {
+	ctx := context.Background()
+	s := NewStats(ctx)
+
+	rs, err := s.RemoteStats(false)
+	require.NoError(t, err)
+	assert.Empty(t, rs["errorList"])
+
+	_ = s.Error(errors.New("open /Users/me/Library/Mail: operation not permitted"))
+	counted := s.Error(errors.New("copy a.txt: connection reset"))
+	// An error that has already been counted is not logged twice.
+	_ = s.Error(counted)
+	_ = s.Error(nil)
+
+	rs, err = s.RemoteStats(false)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), rs["errors"])
+	list := rs["errorList"].([]string)
+	assert.Equal(t, []string{
+		"open /Users/me/Library/Mail: operation not permitted",
+		"copy a.txt: connection reset",
+	}, list)
+
+	// The returned list is a copy: later errors and edits don't alias it.
+	list[0] = "mutated"
+	_ = s.Error(errors.New("third"))
+	rs, err = s.RemoteStats(true)
+	require.NoError(t, err)
+	assert.Equal(t, "open /Users/me/Library/Mail: operation not permitted", rs["errorList"].([]string)[0])
+	assert.Len(t, rs["errorList"], 3)
+
+	s.ResetErrors()
+	rs, err = s.RemoteStats(false)
+	require.NoError(t, err)
+	assert.Empty(t, rs["errorList"])
+
+	_ = s.Error(errors.New("after reset"))
+	s.ResetCounters()
+	rs, err = s.RemoteStats(false)
+	require.NoError(t, err)
+	assert.Empty(t, rs["errorList"])
+}
+
+func TestRemoteStatsErrorListIsCapped(t *testing.T) {
+	ctx := context.Background()
+	s := NewStats(ctx)
+	for i := 0; i < MaxErrorLog+25; i++ {
+		_ = s.Error(fmt.Errorf("error %d", i))
+	}
+	rs, err := s.RemoteStats(false)
+	require.NoError(t, err)
+	assert.Equal(t, int64(MaxErrorLog+25), rs["errors"])
+	list := rs["errorList"].([]string)
+	require.Len(t, list, MaxErrorLog)
+	assert.Equal(t, "error 0", list[0], "the first errors are kept, in order")
+	assert.Equal(t, fmt.Sprintf("error %d", MaxErrorLog-1), list[MaxErrorLog-1])
 }
 
 // make time ranges from string description for testing
