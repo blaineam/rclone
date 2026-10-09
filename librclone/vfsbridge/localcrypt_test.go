@@ -26,6 +26,7 @@ import (
 	_ "github.com/rclone/rclone/backend/crypt"
 	_ "github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configfile"
 	"github.com/rclone/rclone/fs/config/obscure"
@@ -65,6 +66,11 @@ func newLocalCryptServer(t *testing.T) (*Server, string, string) {
 	}
 	config.SetConfigPath(confPath)
 	configfile.Install()
+	// crypt resolves its base (lc_folder:vault) through the process-wide fs
+	// cache, so a previous run of this test (go test -count=N) would hand back
+	// a Fs pointing at that run's deleted temp dir. Start from an empty cache.
+	cache.Clear()
+	useTempCacheDir(t)
 
 	s := NewServer()
 	for _, name := range []string{"lc_bare", "lc_alias"} {

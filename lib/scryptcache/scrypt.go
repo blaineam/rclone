@@ -391,8 +391,12 @@ func ReencryptAllCaches(oldPassword, newPassword string) (int, error) {
 
 	cacheSubDir := filepath.Join(dir, "scrypt_cache")
 	if _, err := os.Stat(cacheSubDir); os.IsNotExist(err) {
-		// No cache directory, nothing to re-encrypt
+		// No cache directory, nothing to re-encrypt -- but the password has
+		// still rolled. Returning without adopting it left keys derived from
+		// now on cached under the OLD password, which the FPE (on the new
+		// one) cannot decrypt, so it deletes them as stale and misses.
 		fmt.Println("[scryptcache] 📁 No scrypt cache directory exists, skipping re-encryption")
+		SetEncryptionPassword(newPassword)
 		return 0, nil
 	}
 

@@ -40,6 +40,7 @@ func newTestServer(t *testing.T) (*Server, string, string) {
 	}
 	config.SetConfigPath(confPath)
 	configfile.Install()
+	useTempCacheDir(t)
 
 	s := NewServer()
 	// Two remotes: the aggregate-root path is where every bug on this branch
@@ -184,4 +185,16 @@ func TestRenameOntoOpenDestination(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(backingA, "src.txt")); !os.IsNotExist(err) {
 		t.Fatal("source still present after rename")
 	}
+}
+
+// useTempCacheDir points the VFS cache (and the .DS_Store purge Start runs)
+// at a per-test temp dir, so tests never read or write the user's real
+// rclone cache. Restored when the test ends.
+func useTempCacheDir(t *testing.T) {
+	t.Helper()
+	prev := config.GetCacheDir()
+	if err := config.SetCacheDir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = config.SetCacheDir(prev) })
 }

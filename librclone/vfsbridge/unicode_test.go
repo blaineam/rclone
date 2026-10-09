@@ -38,6 +38,7 @@ func newByteExactServer(t *testing.T, nfcDir string, files ...string) *Server {
 	}
 	config.SetConfigPath(confPath)
 	configfile.Install()
+	useTempCacheDir(t)
 
 	ctx := context.Background()
 	f, err := fs.NewFs(ctx, "rem_x:")

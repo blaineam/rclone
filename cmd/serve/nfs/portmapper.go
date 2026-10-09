@@ -12,8 +12,11 @@ import (
 	"github.com/rclone/rclone/fs"
 )
 
+// pmapAddr is where rpcbind listens. A variable only so tests can point the
+// registration at a fake portmapper instead of the machine's real one.
+var pmapAddr = "127.0.0.1:111"
+
 const (
-	pmapAddr    = "127.0.0.1:111"
 	pmapProgram = 100000
 	pmapVersion = 2
 	pmapProcSet = 1

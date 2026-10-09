@@ -121,6 +121,22 @@ func (t *HandleTable) PopAll(itemID uint64) []vfs.Handle {
 	return out
 }
 
+// PopEverything removes and returns every handle in the table, for every
+// item. Used by Server.Stop, which must release open handles before it can
+// drain uploads.
+func (t *HandleTable) PopEverything() []vfs.Handle {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var out []vfs.Handle
+	for id, entries := range t.handles {
+		for _, e := range entries {
+			out = append(out, e.h)
+		}
+		delete(t.handles, id)
+	}
+	return out
+}
+
 // HasWriter reports whether any handle for this item was opened for writing.
 func (t *HandleTable) HasWriter(itemID uint64) bool {
 	t.mu.RLock()

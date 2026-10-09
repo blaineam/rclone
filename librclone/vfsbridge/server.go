@@ -313,6 +313,17 @@ func (s *Server) Stop() {
 	if s.listener != nil {
 		s.listener.Close()
 	}
+	// Close our own handles FIRST, for the same reason RemoveRemote does:
+	// WaitForWriters counts every open cache item -- read handles included --
+	// so with any handle still in the table (a lazily-opened read handle stays
+	// there until reclaim) it waited out the whole 30s timeout for handles
+	// that only Stop itself could release. Closing a write handle queues its
+	// upload, which the drain below then waits for.
+	for _, h := range s.handles.PopEverything() {
+		if err := h.Close(); err != nil {
+			fs.Errorf(nil, "VFS bridge: closing handle at shutdown: %v", err)
+		}
+	}
 	// Flush before tearing anything down. Shutting a VFS down with uploads
 	// still queued discards them silently.
 	s.WaitForWriters(shutdownFlushTimeout)

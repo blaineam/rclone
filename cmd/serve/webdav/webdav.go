@@ -2,6 +2,7 @@
 package webdav
 
 import (
+	"bytes"
 	"context"
 	"encoding/xml"
 	"fmt"
@@ -630,13 +631,17 @@ func (h Handle) DeadProps() (map[xml.Name]webdav.Property, error) {
 	)
 	// Inject DAV:displayname for the root so macOS mounts the volume with
 	// the configured name instead of falling back to "127.0.0.1".
+	//
+	// InnerXML is emitted verbatim, so the name must be XML-escaped: a volume
+	// called e.g. "Tom & Jerry" otherwise produced a malformed PROPFIND reply
+	// that the macOS WebDAV client refuses, failing the mount outright. The
+	// property is built in its own variable so none of it carries into the
+	// properties built below.
 	if h.w.displayName != "" && h.Handle.Node().Path() == "" {
-		xmlName = xml.Name{Space: "DAV:", Local: "displayname"}
-		property = webdav.Property{
-			XMLName:  xmlName,
-			InnerXML: []byte(h.w.displayName),
-		}
-		properties[xmlName] = property
+		var escaped bytes.Buffer
+		_ = xml.EscapeText(&escaped, []byte(h.w.displayName))
+		name := xml.Name{Space: "DAV:", Local: "displayname"}
+		properties[name] = webdav.Property{XMLName: name, InnerXML: escaped.Bytes()}
 	}
 	if h.w.etagHashType != hash.None {
 		entry := h.Handle.Node().DirEntry()
