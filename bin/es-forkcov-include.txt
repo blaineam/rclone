@@ -1,0 +1,51 @@
+# Enter Space fork coverage include list — GENERATED, do not edit.
+# Regenerate after every upstream merge: bin/es-fork-coverage.sh --regen
+# base v1.75.1 687d264b689b8c49a67e2e52a8a5e0caa01c04ce
+# head f7af15c3e67b6b62afbf1cf0a7390bc8a8262ffa
+# <file> <from>-<to> <func> | <file> * (fork-added, whole file)
+backend/crypt/cipher.go 232-256 (*Cipher).Key
+backend/drime/drime.go 290-315 (*Fs).readMetaDataForPath
+backend/drime/drime.go 461-473 (*Fs).FindLeaf
+backend/dropbox/dropbox.go 1461-1558 (*Fs).PublicLink
+backend/iclouddrive/iclouddrive.go 104-120 (*Fs).findLeafItem
+backend/internxt/internxt.go 515-533 (*Fs).FindLeaf
+backend/internxt/internxt.go 566-574 normVariants
+backend/internxt/internxt.go 583-594 (*Fs).preUploadCheck
+backend/internxt/internxt.go 598-636 (*Fs).preUploadCheckOne
+backend/internxt/internxt.go 768-803 (*Fs).NewObject
+backend/local/icloud_darwin.go *
+# skipped backend/local/icloud_other.go: build constraints exclude this host
+backend/local/local.go 1437-1527 (*Object).Open
+backend/sftp/sftp.go 2613-2619 statusCodeOf
+backend/sftp/sftp.go 2621-2678 (*Fs).stat
+cmd/serve/nfs/portmapper.go *
+cmd/serve/nfs/server.go 27-54 NewServer
+cmd/serve/webdav/webdav.go 268-344 newWebDAV
+cmd/serve/webdav/webdav.go 626-673 (Handle).DeadProps
+fs/accounting/stats.go 119-168 (*StatsInfo).RemoteStats
+fs/accounting/stats.go 723-752 (*StatsInfo).ResetCounters
+fs/accounting/stats.go 755-764 (*StatsInfo).ResetErrors
+fs/accounting/stats.go 774-800 (*StatsInfo).Error
+fs/list/sorter.go 140-184 (*Sorter).startExtSort
+fs/operations/lsjson.go 275-400 StatJSON
+fs/rc/internal.go 233-274 rcVersion
+# skipped fs/versionsuffix.go: declarations only (no statements changed)
+lib/dircache/dircache.go 101-103 normKey
+lib/dircache/dircache.go 113-115 NameEqual
+lib/dircache/dircache.go 123-128 (*DirCache).Get
+lib/dircache/dircache.go 146-151 (*DirCache).Put
+lib/dircache/dircache.go 179-206 (*DirCache).FlushDir
+lib/dircache/dircache.go 246-314 (*DirCache)._findDir
+lib/oauthutil/enterspace_mobile.go *
+lib/scryptcache/scrypt.go *
+# skipped librclone/gomobile/cpu_ios_stub.go: build constraints exclude this host
+librclone/gomobile/gomobile.go 27-29 Initialize
+librclone/gomobile/gomobile.go 33-35 Finalize
+librclone/gomobile/gomobile.go 52-58 RPC
+librclone/gomobile/gomobile.go 64-89 StartVFSBridge
+librclone/gomobile/gomobile.go 100-112 RemoveVFSBridgeRemote
+librclone/gomobile/gomobile.go 117-125 VFSBridgeGeneration
+librclone/gomobile/gomobile.go 129-137 StopVFSBridge
+librclone/vfsbridge/handles.go *
+librclone/vfsbridge/inode.go *
+librclone/vfsbridge/server.go *
