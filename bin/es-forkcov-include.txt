@@ -1,29 +1,28 @@
 # Enter Space fork coverage include list — GENERATED, do not edit.
 # Regenerate after every upstream merge: bin/es-fork-coverage.sh --regen
-# base v1.75.1 687d264b689b8c49a67e2e52a8a5e0caa01c04ce
-# head 10cbffc5e8386412c168f21666cfc0ada577a774
+# base v1.75.2 be8d6044eacb843b74d335db0c5fbe09222031fe
+# head b9dfb9d969c3097e49a9913bc250196744b8cc29
 # <file> <from>-<to> <func> | <file> * (fork-added, whole file)
 backend/crypt/cipher.go 232-256 (*Cipher).Key
 backend/drime/drime.go 290-315 (*Fs).readMetaDataForPath
 backend/drime/drime.go 461-473 (*Fs).FindLeaf
-backend/dropbox/dropbox.go 1461-1558 (*Fs).PublicLink
+backend/dropbox/dropbox.go 1464-1561 (*Fs).PublicLink
 backend/iclouddrive/iclouddrive.go 104-120 (*Fs).findLeafItem
-backend/internxt/internxt.go 515-533 (*Fs).FindLeaf
-backend/internxt/internxt.go 566-574 normVariants
-backend/internxt/internxt.go 583-594 (*Fs).preUploadCheck
-backend/internxt/internxt.go 598-636 (*Fs).preUploadCheckOne
-backend/internxt/internxt.go 768-803 (*Fs).NewObject
+backend/internxt/internxt.go 520-541 (*Fs).FindLeaf
+backend/internxt/internxt.go 677-685 normVariants
+backend/internxt/internxt.go 695-706 (*Fs).findFile
+backend/internxt/internxt.go 709-764 (*Fs).findFileOne
 backend/local/icloud_darwin.go *
 # skipped backend/local/icloud_other.go: build constraints exclude this host
-backend/local/local.go 1437-1527 (*Object).Open
+backend/local/local.go 1453-1543 (*Object).Open
 backend/sftp/sftp.go 2613-2619 statusCodeOf
 backend/sftp/sftp.go 2621-2678 (*Fs).stat
 cmd/serve/nfs/nfs.go 127-145 Run
 cmd/serve/nfs/portmapper.go *
 cmd/serve/nfs/server.go 34-62 NewServer
 cmd/serve/nfs/server.go 71-77 (*Server).Shutdown
-cmd/serve/webdav/webdav.go 268-344 newWebDAV
-cmd/serve/webdav/webdav.go 626-673 (Handle).DeadProps
+cmd/serve/webdav/webdav.go 269-346 newWebDAV
+cmd/serve/webdav/webdav.go 658-705 (Handle).DeadProps
 fs/accounting/stats.go 119-168 (*StatsInfo).RemoteStats
 fs/accounting/stats.go 723-752 (*StatsInfo).ResetCounters
 fs/accounting/stats.go 755-764 (*StatsInfo).ResetErrors
@@ -51,7 +50,7 @@ librclone/gomobile/gomobile.go 129-137 StopVFSBridge
 librclone/vfsbridge/handles.go *
 librclone/vfsbridge/inode.go *
 librclone/vfsbridge/server.go *
-vfs/vfs.go 479-485 (*VFS).PendingWriteback
-vfs/vfs.go 489-494 (*VFS).PendingUploads
-vfs/vfscache/cache.go 887-890 (*Cache).PendingUploads
-vfs/vfscache/item.go 1466-1534 (*Item).WriteAtNoOverwrite
+vfs/vfs.go 516-522 (*VFS).PendingWriteback
+vfs/vfs.go 526-531 (*VFS).PendingUploads
+vfs/vfscache/cache.go 895-898 (*Cache).PendingUploads
+vfs/vfscache/item.go 1473-1541 (*Item).WriteAtNoOverwrite
