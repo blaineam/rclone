@@ -17,10 +17,11 @@ import (
 var pmapAddr = "127.0.0.1:111"
 
 const (
-	pmapProgram = 100000
-	pmapVersion = 2
-	pmapProcSet = 1
-	ipprotoTCP  = 6
+	pmapProgram   = 100000
+	pmapVersion   = 2
+	pmapProcSet   = 1
+	pmapProcUnset = 2
+	ipprotoTCP    = 6
 )
 
 // tryRegisterPortmapper registers the NFS (100003) and Mount (100005) RPC programs
@@ -29,11 +30,17 @@ const (
 //
 // Logs a warning and returns silently if rpcbind is not running — the server
 // still works for clients that connect using the explicit port in the nfs:// URL.
-func tryRegisterPortmapper(port int) {
+//
+// Returns the (program, version) pairs rpcbind accepted, which are exactly the
+// ones tryUnregisterPortmapper must remove again at shutdown. A program rpcbind
+// refused (typically because another server already holds it) is NOT returned:
+// PMAP_UNSET matches on program and version only, so unsetting it would delete
+// the other server's registration.
+func tryRegisterPortmapper(port int) (registered [][2]uint32) {
 	conn, err := net.DialTimeout("tcp", pmapAddr, 2*time.Second)
 	if err != nil {
 		fs.Logf(nil, "rpcbind not reachable, skipping portmapper registration: %v", err)
-		return
+		return nil
 	}
 	defer conn.Close()
 
@@ -41,17 +48,52 @@ func tryRegisterPortmapper(port int) {
 		{100003, 3}, // NFS program
 		{100005, 3}, // Mount program
 	} {
-		if err := pmapSetCall(conn, prog[0], prog[1], uint32(port)); err != nil {
+		if err := pmapCall(conn, pmapProcSet, prog[0], prog[1], uint32(port)); err != nil {
 			fs.Logf(nil, "portmapper: failed to register program %d: %v", prog[0], err)
 		} else {
 			fs.Logf(nil, "portmapper: registered program %d v%d TCP port %d", prog[0], prog[1], port)
+			registered = append(registered, prog)
+		}
+	}
+	return registered
+}
+
+// tryUnregisterPortmapper removes registrations made by tryRegisterPortmapper.
+//
+// Without it every server that ever ran left rpcbind advertising its program
+// on a port that is now closed (or, worse, reused by something else), so the
+// next NFS client to ask the portmapper was sent to a dead port until rpcbind
+// restarted. Best effort, like registration: failures are logged, never fatal.
+func tryUnregisterPortmapper(port int, programs [][2]uint32) {
+	if len(programs) == 0 {
+		return
+	}
+	conn, err := net.DialTimeout("tcp", pmapAddr, 2*time.Second)
+	if err != nil {
+		fs.Logf(nil, "rpcbind not reachable, skipping portmapper unregistration: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	for _, prog := range programs {
+		if err := pmapCall(conn, pmapProcUnset, prog[0], prog[1], uint32(port)); err != nil {
+			fs.Logf(nil, "portmapper: failed to unregister program %d: %v", prog[0], err)
+		} else {
+			fs.Logf(nil, "portmapper: unregistered program %d v%d", prog[0], prog[1])
 		}
 	}
 }
 
 // pmapSetCall sends a single PMAP_SET (procedure 1) RPC call on conn and reads the reply.
-// The RPC wire format is Sun RPC (RFC 5531) with TCP record marking (RFC 5531 §11).
 func pmapSetCall(conn net.Conn, prognum, versnum, port uint32) error {
+	return pmapCall(conn, pmapProcSet, prognum, versnum, port)
+}
+
+// pmapCall sends a single PMAP_SET or PMAP_UNSET RPC call on conn and reads
+// the boolean reply. Both take the same mapping argument (PMAP_UNSET ignores
+// the protocol and port). The RPC wire format is Sun RPC (RFC 5531) with TCP
+// record marking (RFC 5531 §11).
+func pmapCall(conn net.Conn, proc, prognum, versnum, port uint32) error {
 	xid := rand.Uint32()
 
 	// RPC CALL body: 14 uint32s = 56 bytes
@@ -59,7 +101,7 @@ func pmapSetCall(conn net.Conn, prognum, versnum, port uint32) error {
 	//  verfFlavor=0, verfLen=0, prognum, versnum, protocol, port]
 	body := make([]byte, 56)
 	for i, v := range []uint32{
-		xid, 0, 2, pmapProgram, pmapVersion, pmapProcSet, // header
+		xid, 0, 2, pmapProgram, pmapVersion, proc, // header
 		0, 0, 0, 0, // AUTH_NULL cred + verf
 		prognum, versnum, ipprotoTCP, port, // PMAP_SET args
 	} {
@@ -108,6 +150,9 @@ func pmapSetCall(conn net.Conn, prognum, versnum, port uint32) error {
 		return fmt.Errorf("call not accepted (accept_stat=%d)", binary.BigEndian.Uint32(reply[20:]))
 	}
 	if binary.BigEndian.Uint32(reply[24:]) != 1 {
+		if proc == pmapProcUnset {
+			return fmt.Errorf("portmapper returned false — not registered")
+		}
 		return fmt.Errorf("portmapper returned false — already registered?")
 	}
 	return nil
@@ -122,4 +167,14 @@ func pmapReadAll(conn net.Conn, buf []byte) error {
 		}
 	}
 	return nil
+}
+
+// SetPortmapperAddrForTest points rpcbind registration at addr and returns a
+// function restoring the previous address. For tests of packages built on
+// this server (nfsmount), which must never register throwaway ports with the
+// machine's real rpcbind. Not for production use.
+func SetPortmapperAddrForTest(addr string) (restore func()) {
+	old := pmapAddr
+	pmapAddr = addr
+	return func() { pmapAddr = old }
 }

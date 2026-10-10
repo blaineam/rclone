@@ -18,6 +18,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/flags"
 	"github.com/rclone/rclone/fs/rc"
+	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/rclone/rclone/vfs/vfsflags"
@@ -134,6 +135,11 @@ func Run(command *cobra.Command, args []string) {
 		if err != nil {
 			return err
 		}
+		// Serve only returns once the listener closes, and Ctrl-C exits via
+		// atexit without returning at all; either way Shutdown has to run so
+		// the rpcbind registrations NewServer made are removed again.
+		defer atexit.Unregister(atexit.Register(func() { _ = s.Shutdown() }))
+		defer func() { _ = s.Shutdown() }()
 		return s.Serve()
 	})
 }

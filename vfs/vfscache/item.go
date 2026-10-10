@@ -1475,6 +1475,25 @@ func (item *Item) WriteAtNoOverwrite(b []byte, off int64) (n int, skipped int, e
 		nn int
 	)
 
+	// A dirty item's size is the size the user gave it, so the remote's
+	// bytes beyond it must never land in the cache file. Without this a
+	// file shrunk by Truncate before any of it was cached was silently
+	// re-extended: Truncate clips the present ranges to the new size,
+	// then the close's _ensure(0, size) starts a downloader whose reads
+	// run past that size, and WriteAtNoOverwrite wrote the old tail back
+	// beyond the truncation point -- which is what got uploaded.
+	//
+	// The bytes past the size are reported processed-but-skipped, so the
+	// downloader stops on its own as it would for already present data.
+	beyond := 0
+	if item.info.Dirty && item.info.Size >= 0 && off+int64(len(b)) > item.info.Size {
+		keep := max(item.info.Size-off, 0)
+		beyond = len(b) - int(keep)
+		b = b[:keep]
+		r.Size = keep
+		foundRanges = item.info.Rs.FindAll(r)
+	}
+
 	// Write the range out ignoring already written chunks
 	// fs.Debugf(item.name, "Ranges = %v", item.info.Rs)
 	for i := range foundRanges {
@@ -1505,6 +1524,10 @@ func (item *Item) WriteAtNoOverwrite(b []byte, off int64) (n int, skipped int, e
 		if err != nil {
 			break
 		}
+	}
+	if err == nil {
+		n += beyond
+		skipped += beyond
 	}
 	item.mu.Unlock()
 	return n, skipped, err

@@ -881,6 +881,14 @@ func (c *Cache) TotalInUse() (n int) {
 	return n
 }
 
+// PendingUploads returns the number of items queued for upload or being
+// uploaded. Unlike TotalInUse it does not count items that are merely open,
+// so a file held open for reading does not look like unfinished writeback.
+func (c *Cache) PendingUploads() int {
+	inProgress, queued := c.writeback.Stats()
+	return inProgress + queued
+}
+
 // Dump the cache into a string for debugging purposes
 func (c *Cache) Dump() string {
 	if c == nil {

@@ -10,6 +10,10 @@ import (
 type handleEntry struct {
 	h     vfs.Handle
 	write bool
+	// lazy marks a read handle the bridge opened itself to serve a read that
+	// arrived with no handle open (see doRead). Nothing on the FSKit side
+	// refers to it, so the bridge may close it whenever that helps.
+	lazy bool
 }
 
 // HandleTable manages open file handles, keyed by item ID.
@@ -51,6 +55,36 @@ func (t *HandleTable) Put(itemID uint64, handle vfs.Handle, write bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.handles[itemID] = append(t.handles[itemID], handleEntry{h: handle, write: write})
+}
+
+// PutLazy records a read handle the bridge opened on its own behalf.
+func (t *HandleTable) PutLazy(itemID uint64, handle vfs.Handle) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.handles[itemID] = append(t.handles[itemID], handleEntry{h: handle, lazy: true})
+}
+
+// PopLazy removes and returns the lazily opened read handles of an item,
+// leaving every handle FSKit opened in place.
+func (t *HandleTable) PopLazy(itemID uint64) []vfs.Handle {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	entries := t.handles[itemID]
+	var out []vfs.Handle
+	kept := entries[:0]
+	for _, e := range entries {
+		if e.lazy {
+			out = append(out, e.h)
+		} else {
+			kept = append(kept, e)
+		}
+	}
+	if len(kept) == 0 {
+		delete(t.handles, itemID)
+	} else {
+		t.handles[itemID] = kept
+	}
+	return out
 }
 
 // GetForWrite returns a handle able to service a write, preferring one opened

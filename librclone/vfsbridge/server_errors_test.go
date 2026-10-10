@@ -234,17 +234,15 @@ func TestGetAttrAndSetAttr(t *testing.T) {
 	}
 }
 
-// TestSetAttrTruncateOfUncachedFile documents an UPSTREAM rclone VFS bug
-// (vfs/vfscache, unmodified by this fork) that the bridge's setattr(size)
-// inherits: shrinking a file whose bytes are not in the VFS cache is undone on
-// close. Item.Truncate clips the cached ranges to [0,size), then
-// _actualClose's _ensure(0,size) starts a downloader that writes the remote's
-// full content back over the truncated cache file, and that is what gets
-// uploaded. Reproduces with plain vfs.New + File.Truncate, any ReadAhead.
-// Skipped until fixed upstream (or worked around in doSetAttr); unskip to
-// check.
+// TestSetAttrTruncateOfUncachedFile pins a fix to rclone's VFS cache (in
+// vfs/vfscache/item.go, so an upstream file this fork patches): shrinking a
+// file whose bytes are not in the cache was undone on close. Item.Truncate
+// clipped the cached ranges to [0,size), then _actualClose's _ensure(0,size)
+// started a downloader that wrote the remote's full content back past the
+// truncation point, and that is what got uploaded. WriteAtNoOverwrite now
+// never writes past a dirty item's size. Upstream report:
+// docs/UPSTREAM-VFS-TRUNCATE.md in the Enter Space repo.
 func TestSetAttrTruncateOfUncachedFile(t *testing.T) {
-	t.Skip("known upstream vfscache bug: truncate of an uncached file is re-extended on close")
 	s, backingA, _ := newTestServer(t)
 	writeFile(t, backingA, "f.txt", "0123456789")
 	fileID := childID(t, s, remoteRootID(t, s, "rem_a"), "f.txt")

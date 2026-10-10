@@ -469,6 +469,30 @@ func (vfs *VFS) WaitForWriters(timeout time.Duration) {
 	}
 }
 
+// PendingWriteback returns the number of files with an open writer plus the
+// number of uploads queued or in progress.
+//
+// WaitForWriters also counts every open cache item, read handles included, so
+// a caller that only needs written data to reach the remote -- a durable
+// close(2), say -- waits out its whole timeout whenever anything is open for
+// reading. This counts writers only.
+func (vfs *VFS) PendingWriteback() int {
+	n := vfs.root.countActiveWriters()
+	if vfs.cache != nil {
+		n += vfs.cache.PendingUploads()
+	}
+	return n
+}
+
+// PendingUploads returns the number of uploads queued or in progress, without
+// counting open writers.
+func (vfs *VFS) PendingUploads() int {
+	if vfs.cache == nil {
+		return 0
+	}
+	return vfs.cache.PendingUploads()
+}
+
 // Root returns the root node
 func (vfs *VFS) Root() (*Dir, error) {
 	// fs.Debugf(vfs.f, "Root()")

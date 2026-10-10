@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 
 	nfs "github.com/willscott/go-nfs"
 
@@ -21,6 +22,12 @@ type Server struct {
 	ctx                 context.Context // for global config
 	listener            net.Listener
 	UnmountedExternally bool
+	// pmapPort and pmapPrograms record what NewServer registered with
+	// rpcbind, so Shutdown can remove exactly that and nothing else.
+	pmapPort     int
+	pmapPrograms [][2]uint32
+	shutdownOnce sync.Once
+	shutdownErr  error
 }
 
 // NewServer creates a new server
@@ -48,7 +55,8 @@ func NewServer(ctx context.Context, vfs *vfs.VFS, opt *Options) (s *Server, err 
 	// Register with local rpcbind so macOS NFS clients can discover us via portmapper.
 	// Both NFS (100003) and Mount (100005) programs are served on the same port by go-nfs.
 	if tcpAddr, ok := s.listener.Addr().(*net.TCPAddr); ok {
-		tryRegisterPortmapper(tcpAddr.Port)
+		s.pmapPort = tcpAddr.Port
+		s.pmapPrograms = tryRegisterPortmapper(tcpAddr.Port)
 	}
 	return s, nil
 }
@@ -58,9 +66,14 @@ func (s *Server) Addr() net.Addr {
 	return s.listener.Addr()
 }
 
-// Shutdown stops the server
+// Shutdown stops the server and removes its rpcbind registrations. Safe to
+// call more than once.
 func (s *Server) Shutdown() error {
-	return s.listener.Close()
+	s.shutdownOnce.Do(func() {
+		s.shutdownErr = s.listener.Close()
+		tryUnregisterPortmapper(s.pmapPort, s.pmapPrograms)
+	})
+	return s.shutdownErr
 }
 
 // Serve starts the server

@@ -202,7 +202,7 @@ func (s *Server) RemoveRemote(remoteName string) (retErr error) {
 			}
 		}
 	}
-	v.WaitForWriters(removeFlushTimeout)
+	s.waitForWriteback([]*vfs.VFS{v}, removeFlushTimeout, (*vfs.VFS).PendingWriteback)
 	v.Shutdown()
 
 	fs.Infof(nil, "VFS bridge: removed remote %q", remoteName)
@@ -285,27 +285,67 @@ func (s *Server) ListenAddr() string {
 	return s.listener.Addr().String()
 }
 
-// Stop shuts down the server and all VFS instances.
-// WaitForWriters blocks until every mounted remote has flushed its pending
-// uploads, or until timeout elapses.
+// WaitForWriters blocks until every mounted remote has no file open for
+// writing and no upload queued or running, or until timeout elapses.
 //
 // With CacheModeFull a write lands in the local cache and is uploaded
 // asynchronously, so "the handle closed" does not mean "the data is on the
 // remote". Anything that claims durability -- sync, unmount, deactivate,
 // shutdown -- has to go through here first.
+//
+// Read handles are deliberately NOT waited for. This used to call
+// vfs.WaitForWriters, which also counts every open cache item, so any file
+// merely open for reading -- including the read handles doRead opens lazily
+// and keeps until reclaim -- made every durability point wait out its whole
+// timeout for a "writer" that was never going to write.
 func (s *Server) WaitForWriters(timeout time.Duration) {
+	s.waitForWriteback(s.allVFSes(), timeout, (*vfs.VFS).PendingWriteback)
+}
+
+// waitForUploads is WaitForWriters without the open-writer count: it waits
+// only for uploads already queued or running. A write-close uses it, since a
+// DIFFERENT file someone still has open for writing has nothing to do with
+// whether this close is durable.
+func (s *Server) waitForUploads(timeout time.Duration) {
+	s.waitForWriteback(s.allVFSes(), timeout, (*vfs.VFS).PendingUploads)
+}
+
+func (s *Server) allVFSes() []*vfs.VFS {
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	vfses := make([]*vfs.VFS, 0, len(s.vfses))
 	for _, v := range s.vfses {
 		vfses = append(vfses, v)
 	}
-	s.mu.RUnlock()
+	return vfses
+}
 
-	for _, v := range vfses {
-		v.WaitForWriters(timeout)
+// waitForWriteback polls pending(v) across vfses until it is zero everywhere
+// or timeout elapses. The first polls are a few milliseconds apart: a durable
+// close(2) is on the request path, and an upload over loopback or a LAN is
+// usually done well inside the first tick.
+func (s *Server) waitForWriteback(vfses []*vfs.VFS, timeout time.Duration, pending func(*vfs.VFS) int) {
+	deadline := time.Now().Add(timeout)
+	tick := 2 * time.Millisecond
+	for {
+		n := 0
+		for _, v := range vfses {
+			n += pending(v)
+		}
+		if n == 0 {
+			return
+		}
+		left := time.Until(deadline)
+		if left <= 0 {
+			fs.Errorf(nil, "VFS bridge: still %d writer(s)/upload(s) pending after %v, giving up waiting", n, timeout)
+			return
+		}
+		time.Sleep(min(tick, left))
+		tick = min(tick*2, 250*time.Millisecond)
 	}
 }
 
+// Stop shuts down the server and all VFS instances.
 func (s *Server) Stop() {
 	if s.closed.Swap(true) {
 		return
@@ -313,12 +353,11 @@ func (s *Server) Stop() {
 	if s.listener != nil {
 		s.listener.Close()
 	}
-	// Close our own handles FIRST, for the same reason RemoveRemote does:
-	// WaitForWriters counts every open cache item -- read handles included --
-	// so with any handle still in the table (a lazily-opened read handle stays
-	// there until reclaim) it waited out the whole 30s timeout for handles
-	// that only Stop itself could release. Closing a write handle queues its
-	// upload, which the drain below then waits for.
+	// Close our own handles FIRST, for the same reason RemoveRemote does: an
+	// open write handle is a writer WaitForWriters waits for, and only Stop
+	// itself can release it, so draining first waited out the whole 30s.
+	// Closing a write handle queues its upload, which the drain below then
+	// waits for.
 	for _, h := range s.handles.PopEverything() {
 		if err := h.Close(); err != nil {
 			fs.Errorf(nil, "VFS bridge: closing handle at shutdown: %v", err)
@@ -1190,6 +1229,19 @@ func (s *Server) doClose(req *Request) *Response {
 	if handle == nil {
 		return okResp(req.ID, nil)
 	}
+	if wasWrite {
+		// rclone stores a dirty file only when its LAST open handle closes, so
+		// a lazily-opened read handle on the same item (see doRead) would hold
+		// the write in the local cache until reclaim -- close(2) reporting
+		// success for bytes that are not on the remote. Those handles are the
+		// bridge's own; drop them first so this close is the last one. A later
+		// read simply opens a fresh one.
+		for _, h := range s.handles.PopLazy(args.ItemID) {
+			if err := h.Close(); err != nil {
+				fs.Errorf(nil, "VFS bridge: closing lazy read handle of item %d: %v", args.ItemID, err)
+			}
+		}
+	}
 	// A close error is the filesystem's last chance to say the data did not
 	// make it. With CacheModeFull this is where the upload is queued, so
 	// swallowing it at debug level reported a durable write that never
@@ -1201,8 +1253,13 @@ func (s *Server) doClose(req *Request) *Response {
 	// Closing a write handle queues the upload but does not wait for it.
 	// Drain the queue here so close(2) is actually durable. Short bound —
 	// the module's request timeout is 10s and the caller may also call sync.
+	//
+	// Uploads only: this used to wait on every open cache item, read handles
+	// included, so a write-close with any reader open anywhere on the volume
+	// stalled the full 8s -- and stalled every request queued behind it on
+	// that connection.
 	if wasWrite {
-		s.WaitForWriters(closeFlushTimeout)
+		s.waitForUploads(closeFlushTimeout)
 	}
 	return okResp(req.ID, nil)
 }
@@ -1255,7 +1312,7 @@ func (s *Server) doRead(req *Request) *Response {
 			fs.Errorf(nil, "VFS bridge: lazy read-open of item %d failed: %v", args.ItemID, err)
 			return errorResp(req.ID, mapVFSErr(err))
 		}
-		s.handles.Put(args.ItemID, h, false)
+		s.handles.PutLazy(args.ItemID, h)
 		handle = h
 	}
 	buf := make([]byte, args.Length)
