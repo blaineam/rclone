@@ -1,6 +1,6 @@
 package internxt
 
-// FindLeaf / NewObject / preUploadCheck against a fake Internxt API on
+// FindLeaf / NewObject / findFile against a fake Internxt API on
 // loopback. The fake stores names in NFC and, like the real server's
 // existence check, matches them byte-wise -- the situation the fork's
 // normalization-insensitive matching exists for.
@@ -181,68 +181,73 @@ func TestNewObjectNormalizationInsensitive(t *testing.T) {
 	_, err = f.NewObject(ctx, "nodir/x.txt")
 	assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
 
-	// Listing failure is an error, not "not found". The parent dir is cached
-	// by now so the failure lands on the file listing.
-	srv.failList = http.StatusBadRequest
+	// A failing lookup is an error, not "not found". The parent dir is
+	// cached by now so the failure lands on the file existence check.
+	srv.failExist = http.StatusBadRequest
 	_, err = f.NewObject(ctx, "x.txt")
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, fs.ErrorObjectNotFound)
 }
 
-func TestPreUploadCheckTriesNormalizationVariants(t *testing.T) {
+// findFile (used by NewObject, Put and Update) retries the byte-wise
+// existence check with the other Unicode normalization form. Upstream's
+// findFile asks for two spellings per name (split at the extension, and
+// the whole name with no type), so each variant costs two criteria.
+func TestFindFileTriesNormalizationVariants(t *testing.T) {
 	f, srv, ctx := newFakeInternxtFs(t)
 
 	// NFD in, NFC stored: the first (verbatim) check misses, the NFC
 	// variant finds the existing file instead of creating a duplicate.
-	file, err := f.preUploadCheck(ctx, nfd+".txt", fakeRootID)
+	file, err := f.findFile(ctx, nfd+".txt", fakeRootID)
 	require.NoError(t, err)
 	require.NotNil(t, file)
 	assert.Equal(t, "file-cafe", file.UUID)
-	assert.Equal(t, []string{nfd + ".txt", nfc + ".txt"}, srv.existChecks)
+	assert.Equal(t, []string{nfd + ".txt", nfd + ".txt.", nfc + ".txt", nfc + ".txt."}, srv.existChecks)
 
-	// Verbatim match: one check only.
+	// Verbatim match: the first variant's request only.
 	srv.existChecks = nil
-	file, err = f.preUploadCheck(ctx, nfc+".txt", fakeRootID)
+	file, err = f.findFile(ctx, nfc+".txt", fakeRootID)
 	require.NoError(t, err)
 	require.NotNil(t, file)
-	assert.Len(t, srv.existChecks, 1)
+	assert.Len(t, srv.existChecks, 2)
 
 	// Not there in any form.
-	file, err = f.preUploadCheck(ctx, "new.txt", fakeRootID)
+	file, err = f.findFile(ctx, "new.txt", fakeRootID)
 	require.NoError(t, err)
 	assert.Nil(t, file)
 
 	// Same base name, different extension: not the same file.
-	file, err = f.preUploadCheck(ctx, nfc+".md", fakeRootID)
+	file, err = f.findFile(ctx, nfc+".md", fakeRootID)
 	require.NoError(t, err)
 	assert.Nil(t, file)
 }
 
-func TestPreUploadCheckErrors(t *testing.T) {
+func TestFindFileErrors(t *testing.T) {
 	f, srv, ctx := newFakeInternxtFs(t)
 
-	// A failing existence check is treated as "does not exist" so the
-	// upload can proceed.
-	srv.failExist = http.StatusInternalServerError
-	file, err := f.preUploadCheck(ctx, nfd+".txt", fakeRootID)
-	require.NoError(t, err)
-	assert.Nil(t, file)
+	// Since v1.75.2 a failing existence check is surfaced (upstream no
+	// longer guesses "does not exist", which could overwrite or duplicate),
+	// and it stops the variant loop.
+	srv.failExist = http.StatusBadRequest
+	_, err := f.findFile(ctx, nfd+".txt", fakeRootID)
+	require.Error(t, err)
+	assert.Empty(t, srv.existChecks)
 
-	// But a failing metadata fetch for a file that does exist is an error,
+	// A failing metadata fetch for a file that does exist is an error,
 	// and stops the variant loop.
 	srv.failExist = 0
 	srv.failMeta = http.StatusBadRequest
 	srv.existChecks = nil
-	_, err = f.preUploadCheck(ctx, nfc+".txt", fakeRootID)
+	_, err = f.findFile(ctx, nfc+".txt", fakeRootID)
 	require.Error(t, err)
-	assert.Len(t, srv.existChecks, 1)
+	assert.Len(t, srv.existChecks, 2)
 }
 
 // An existence hit without a UUID cannot be resolved to a file.
-func TestPreUploadCheckExistsWithoutUUID(t *testing.T) {
+func TestFindFileExistsWithoutUUID(t *testing.T) {
 	f, srv, ctx := newFakeInternxtFs(t)
 	srv.files[fakeRootID] = append(srv.files[fakeRootID], fakeFile{PlainName: "ghost", Type: "bin"})
-	file, err := f.preUploadCheck(ctx, "ghost.bin", fakeRootID)
+	file, err := f.findFile(ctx, "ghost.bin", fakeRootID)
 	require.NoError(t, err)
 	assert.Nil(t, file)
 }
