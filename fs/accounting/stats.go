@@ -819,6 +819,9 @@ func (s *StatsInfo) DoneChecking(remote string) {
 	s.checking.del(remote)
 	s.mu.Lock()
 	s.checks++
+	if s.transferring.empty() && s.checking.empty() {
+		s._stopAverageLoop()
+	}
 	s.mu.Unlock()
 }
 
@@ -858,15 +861,13 @@ func (s *StatsInfo) NewTransferRemoteSize(remote string, size int64, srcFs, dstF
 // if ok is true and it was in the transfermap (to avoid incrementing in case of nested calls, #6213) then it increments the transfers count
 func (s *StatsInfo) DoneTransferring(remote string, ok bool) {
 	existed := s.transferring.del(remote)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if ok && existed {
-		s.mu.Lock()
 		s.transfers++
-		s.mu.Unlock()
 	}
 	if s.transferring.empty() && s.checking.empty() {
-		s.mu.Lock()
 		s._stopAverageLoop()
-		s.mu.Unlock()
 	}
 }
 
