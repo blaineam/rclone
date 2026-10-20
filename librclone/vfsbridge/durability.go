@@ -56,10 +56,32 @@ var (
 	// writeStallMax bounds how long one write call is held, kept well under the FSKit
 	// module's request timeout, so a stalled upload slows a copy but never fails it.
 	writeStallMax = 6 * time.Second
+
+	// throughBufferSize is the read-ahead rclone keeps on a streaming upload. Small, so the
+	// writer is held to the upload's pace; it is made of 1MiB buffers, so under 1MiB means none.
+	throughBufferSize = 2 * fs.Mebi
 )
 
 // SetConfirmUploads turns "close waits for the upload" on or off. On by default.
 func (s *Server) SetConfirmUploads(on bool) { s.confirmUploads.Store(on) }
+
+// RemoteMode says how writes to a remote are done.
+type RemoteMode struct {
+	// Mode is "cached" (writes land in the local cache and upload in the background) or
+	// "through" (writes stream to the remote).
+	Mode string `json:"mode"`
+	// Note explains a request that could not be honoured.
+	Note string `json:"note,omitempty"`
+}
+
+// SetWriteThrough records whether remote should stream its writes. It applies the next
+// time the remote is added to the volume (the app removes and re-adds it, which flushes
+// whatever is pending first), so changing it never disturbs a transfer in flight.
+func (s *Server) SetWriteThrough(remote string, on bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writeThrough[remote] = on
+}
 
 // SetFlowControl turns write back pressure on or off. On by default.
 func (s *Server) SetFlowControl(on bool) { s.flowControl.Store(on) }
@@ -127,6 +149,10 @@ type RemoteUploads struct {
 	QueuedBytes    int64        `json:"queuedBytes"`
 	FailingFiles   int          `json:"failingFiles"`
 	Items          []UploadItem `json:"items"` // capped; failing and uploading first
+	// WriteMode is "cached" or "through"; WriteModeNote explains a streaming request that
+	// the remote could not honour.
+	WriteMode     string `json:"writeMode"`
+	WriteModeNote string `json:"writeModeNote,omitempty"`
 }
 
 // UploadStatus is the upload queue of every exposed remote.
@@ -157,7 +183,12 @@ func (s *Server) UploadStatus() UploadStatus {
 		if v == nil {
 			continue
 		}
-		ru := RemoteUploads{Remote: name, Items: []UploadItem{}}
+		ru := RemoteUploads{Remote: name, Items: []UploadItem{}, WriteMode: "cached"}
+		s.mu.RLock()
+		if m, ok := s.remoteModes[name]; ok {
+			ru.WriteMode, ru.WriteModeNote = m.Mode, m.Note
+		}
+		s.mu.RUnlock()
 		for _, q := range v.UploadQueue() {
 			ru.QueuedFiles++
 			ru.QueuedBytes += q.Size

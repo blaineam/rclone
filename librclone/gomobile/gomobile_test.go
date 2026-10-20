@@ -179,3 +179,34 @@ func TestVFSBridgeUploadStatusAndRescue(t *testing.T) {
 	assert.True(t, strings.HasPrefix(RescueVFSBridgePendingUploads("", true), "error:"))
 	SetVFSBridgeConfirmUploads(true)
 }
+
+func TestVFSBridgeWriteThroughPreferenceBeforeAndAfterStart(t *testing.T) {
+	setupConfig(t)
+	type uploads struct {
+		Remotes []struct {
+			Remote    string `json:"remote"`
+			WriteMode string `json:"writeMode"`
+		} `json:"remotes"`
+	}
+	modes := func() map[string]string {
+		var u uploads
+		require.NoError(t, json.Unmarshal([]byte(VFSBridgeUploadStatus()), &u))
+		out := map[string]string{}
+		for _, r := range u.Remotes {
+			out[r.Remote] = r.WriteMode
+		}
+		return out
+	}
+
+	// Chosen before the bridge exists: applies when the remote is first added.
+	SetVFSBridgeWriteThrough("rem_a", true)
+	require.False(t, strings.HasPrefix(StartVFSBridge("rem_a", 0), "error:"))
+	require.False(t, strings.HasPrefix(StartVFSBridge("rem_b", 0), "error:"))
+	assert.Equal(t, map[string]string{"rem_a": "through", "rem_b": "cached"}, modes())
+
+	// Chosen while running: applies when the remote is next added.
+	SetVFSBridgeWriteThrough("rem_a", false)
+	assert.Equal(t, "", RemoveVFSBridgeRemote("rem_a"))
+	require.False(t, strings.HasPrefix(StartVFSBridge("rem_a", 0), "error:"))
+	assert.Equal(t, "cached", modes()["rem_a"])
+}

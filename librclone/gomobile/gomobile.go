@@ -20,7 +20,9 @@ import (
 
 var (
 	bridgeServer *vfsbridge.Server
-	bridgeMu     sync.Mutex
+	// pendingWriteThrough holds streaming-write choices made before the bridge started.
+	pendingWriteThrough = map[string]bool{}
+	bridgeMu            sync.Mutex
 )
 
 // Initialize initializes rclone as a library
@@ -68,6 +70,9 @@ func StartVFSBridge(remoteName string, port int) string {
 
 	if bridgeServer == nil {
 		bridgeServer = vfsbridge.NewServer()
+		for name, on := range pendingWriteThrough {
+			bridgeServer.SetWriteThrough(name, on)
+		}
 		addr := fmt.Sprintf("localhost:%d", port)
 		listenAddr, err := bridgeServer.Start(addr)
 		if err != nil {
@@ -168,6 +173,23 @@ func RescueVFSBridgePendingUploads(destDir string, onlyFailing bool) string {
 		return "error: " + err.Error()
 	}
 	return string(out)
+}
+
+// SetVFSBridgeWriteThrough chooses whether writes to remoteName stream straight to the
+// remote (true) or land in the local cache and upload in the background (false, the
+// default). It takes effect the next time the remote is added to the volume. Streaming
+// needs a backend that can upload without knowing the size first; otherwise the remote
+// keeps the normal mode, and VFSBridgeUploadStatus says so. Works before the bridge starts.
+// Exported as RcloneSetVFSBridgeWriteThrough
+func SetVFSBridgeWriteThrough(remoteName string, on bool) {
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
+
+	if bridgeServer == nil {
+		pendingWriteThrough[remoteName] = on
+		return
+	}
+	bridgeServer.SetWriteThrough(remoteName, on)
 }
 
 // SetVFSBridgeConfirmUploads chooses whether closing a written file waits for its

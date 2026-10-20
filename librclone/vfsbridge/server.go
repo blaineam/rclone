@@ -51,6 +51,10 @@ type Server struct {
 	// durability.go.
 	confirmUploads atomic.Bool
 	flowControl    atomic.Bool
+	// writeThrough holds, per remote, whether the person asked for streaming writes, and
+	// remoteModes what each exposed remote actually got. Guarded by mu.
+	writeThrough map[string]bool
+	remoteModes  map[string]RemoteMode
 }
 
 const (
@@ -68,6 +72,8 @@ func NewServer() *Server {
 		inodes:        NewInodeTable(),
 		handles:       NewHandleTable(),
 		prefetchSlots: make(chan struct{}, prefetchConcurrency),
+		writeThrough:  make(map[string]bool),
+		remoteModes:   make(map[string]RemoteMode),
 	}
 	// Start at 1: zero is FSDirectoryVerifierInitial on the FSKit side, which
 	// means "no verifier yet" rather than a generation the module chose.
@@ -158,8 +164,29 @@ func (s *Server) AddRemote(remoteName string) (retErr error) {
 	// fresh nonce derivation per stream, and that costs about 20% here.
 	opt.ChunkStreams = 0
 
-	v := vfs.New(context.Background(), f, &opt)
+	mode := RemoteMode{Mode: "cached"}
+	vfsCtx := context.Background()
+	if s.writeThrough[remoteName] {
+		// Stream writes straight to the remote, so the writer is held to the upload's pace
+		// and close(2) means the bytes are there. Needs a backend that can take an upload
+		// of unknown size without spooling the whole file first; without one this would
+		// only move the buffering into rclone's temp files, so keep the normal mode.
+		if f.Features().PutStream != nil {
+			opt.CacheMode = vfscommon.CacheModeOff
+			mode = RemoteMode{Mode: "through"}
+			// rclone reads the stream through an async buffer (16MiB by default), which would
+			// let the writer run that far ahead of the upload and leave close waiting out the
+			// tail. Keep it small for THIS volume only: the setting rides on the context.
+			var ci *fs.ConfigInfo
+			vfsCtx, ci = fs.AddConfig(vfsCtx)
+			ci.BufferSize = throughBufferSize
+		} else {
+			mode.Note = "This remote can't stream uploads, so writes stay buffered."
+		}
+	}
+	v := vfs.New(vfsCtx, f, &opt)
 	s.vfses[remoteName] = v
+	s.remoteModes[remoteName] = mode
 	s.bumpRemoteSet()
 
 	fs.Infof(nil, "VFS bridge: added remote %q", remoteName)
@@ -1225,6 +1252,14 @@ func (s *Server) doOpen(req *Request) *Response {
 	flags := os.O_RDONLY
 	if args.Write {
 		flags = os.O_RDWR
+		// A streaming volume can only write a file from the start, and rclone refuses to
+		// open an existing file for writing unless told to truncate it. An empty file has
+		// nothing to lose, and it is what both a fresh create and an overwrite look like by
+		// the time they are opened (an overwrite is truncated to 0 first), so say so. A
+		// file that already has content is an in-place edit and fails with EPERM.
+		if node.VFS().Opt.CacheMode == vfscommon.CacheModeOff && node.Size() == 0 {
+			flags |= os.O_TRUNC
+		}
 	}
 
 	handle, err := node.Open(flags)
