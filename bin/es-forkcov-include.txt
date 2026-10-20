@@ -1,7 +1,7 @@
 # Enter Space fork coverage include list — GENERATED, do not edit.
 # Regenerate after every upstream merge: bin/es-fork-coverage.sh --regen
 # base v1.75.2 be8d6044eacb843b74d335db0c5fbe09222031fe
-# head b9dfb9d969c3097e49a9913bc250196744b8cc29
+# head f0afdbcd7bf4735f3907459868e87a4ee6950940
 # <file> <from>-<to> <func> | <file> * (fork-added, whole file)
 backend/crypt/cipher.go 232-256 (*Cipher).Key
 backend/drime/drime.go 290-315 (*Fs).readMetaDataForPath
@@ -40,17 +40,26 @@ lib/dircache/dircache.go 246-314 (*DirCache)._findDir
 lib/oauthutil/enterspace_mobile.go *
 lib/scryptcache/scrypt.go *
 # skipped librclone/gomobile/cpu_ios_stub.go: build constraints exclude this host
-librclone/gomobile/gomobile.go 27-29 Initialize
-librclone/gomobile/gomobile.go 33-35 Finalize
-librclone/gomobile/gomobile.go 52-58 RPC
-librclone/gomobile/gomobile.go 64-89 StartVFSBridge
-librclone/gomobile/gomobile.go 100-112 RemoveVFSBridgeRemote
-librclone/gomobile/gomobile.go 117-125 VFSBridgeGeneration
-librclone/gomobile/gomobile.go 129-137 StopVFSBridge
+librclone/gomobile/gomobile.go 30-32 Initialize
+librclone/gomobile/gomobile.go 36-38 Finalize
+librclone/gomobile/gomobile.go 55-61 RPC
+librclone/gomobile/gomobile.go 67-95 StartVFSBridge
+librclone/gomobile/gomobile.go 106-118 RemoveVFSBridgeRemote
+librclone/gomobile/gomobile.go 123-131 VFSBridgeGeneration
+librclone/gomobile/gomobile.go 138-152 VFSBridgeUploadStatus
+librclone/gomobile/gomobile.go 160-176 RescueVFSBridgePendingUploads
+librclone/gomobile/gomobile.go 184-193 SetVFSBridgeWriteThrough
+librclone/gomobile/gomobile.go 198-206 SetVFSBridgeConfirmUploads
+librclone/gomobile/gomobile.go 210-218 StopVFSBridge
+librclone/vfsbridge/durability.go *
 librclone/vfsbridge/handles.go *
 librclone/vfsbridge/inode.go *
 librclone/vfsbridge/server.go *
+vfs/es_upload.go *
 vfs/vfs.go 516-522 (*VFS).PendingWriteback
 vfs/vfs.go 526-531 (*VFS).PendingUploads
 vfs/vfscache/cache.go 895-898 (*Cache).PendingUploads
+vfs/vfscache/es_upload.go *
 vfs/vfscache/item.go 1473-1541 (*Item).WriteAtNoOverwrite
+vfs/vfscache/writeback/es_upload.go *
+vfs/vfscache/writeback/writeback.go 354-400 (*WriteBack).upload
