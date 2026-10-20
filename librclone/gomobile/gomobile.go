@@ -2,6 +2,7 @@
 package rclone
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 
@@ -122,6 +123,64 @@ func VFSBridgeGeneration() int64 {
 		return 0
 	}
 	return int64(bridgeServer.Generation())
+}
+
+// VFSBridgeUploadStatus returns what is waiting to upload through the bridge, per
+// remote, as JSON: {"remotes":[{"remote","queuedFiles","uploadingFiles","queuedBytes",
+// "failingFiles","items":[{"remote","path","size","uploading","tries","retryIn",
+// "failing"}]}],"queuedFiles","queuedBytes","failingFiles"}. Empty when no bridge runs.
+// Exported as RcloneVFSBridgeUploadStatus
+func VFSBridgeUploadStatus() string {
+	bridgeMu.Lock()
+	server := bridgeServer
+	bridgeMu.Unlock()
+
+	status := vfsbridge.UploadStatus{Remotes: []vfsbridge.RemoteUploads{}}
+	if server != nil {
+		status = server.UploadStatus()
+	}
+	out, err := json.Marshal(status)
+	if err != nil {
+		return "{}"
+	}
+	return string(out)
+}
+
+// RescueVFSBridgePendingUploads copies files still waiting to upload out of the cache
+// into destDir as <remote>/<path>, keeping their folder structure, and returns the
+// result as JSON: {"dest","rescued":[{"remote","path","dest","size"}],"skipped":[...,"error"]}.
+// With onlyFailing, only files whose upload keeps failing are copied. The files stay
+// queued and keep retrying. Returns "error: message" on failure.
+// Exported as RcloneRescueVFSBridgePendingUploads
+func RescueVFSBridgePendingUploads(destDir string, onlyFailing bool) string {
+	bridgeMu.Lock()
+	server := bridgeServer
+	bridgeMu.Unlock()
+
+	if server == nil {
+		return "error: no bridge running"
+	}
+	if destDir == "" {
+		return "error: no destination"
+	}
+	out, err := json.Marshal(server.RescuePending(destDir, onlyFailing))
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	return string(out)
+}
+
+// SetVFSBridgeConfirmUploads chooses whether closing a written file waits for its
+// upload (the default) or returns once it is queued. A no-op with no bridge running.
+// Exported as RcloneSetVFSBridgeConfirmUploads
+func SetVFSBridgeConfirmUploads(on bool) {
+	bridgeMu.Lock()
+	server := bridgeServer
+	bridgeMu.Unlock()
+
+	if server != nil {
+		server.SetConfirmUploads(on)
+	}
 }
 
 // StopVFSBridge stops the VFS bridge server.

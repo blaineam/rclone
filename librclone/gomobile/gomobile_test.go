@@ -141,3 +141,41 @@ func TestStartVFSBridgePortInUse(t *testing.T) {
 	require.True(t, strings.HasPrefix(res, "error: "), res)
 	assert.Equal(t, int64(0), VFSBridgeGeneration())
 }
+
+func TestVFSBridgeUploadStatusAndRescue(t *testing.T) {
+	setupConfig(t)
+
+	// No bridge: empty status, rescue refuses.
+	var empty struct {
+		Remotes     []any `json:"remotes"`
+		QueuedFiles int   `json:"queuedFiles"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(VFSBridgeUploadStatus()), &empty))
+	assert.Empty(t, empty.Remotes)
+	assert.Equal(t, 0, empty.QueuedFiles)
+	assert.True(t, strings.HasPrefix(RescueVFSBridgePendingUploads(t.TempDir(), false), "error:"))
+	SetVFSBridgeConfirmUploads(false) // no-op, must not panic
+
+	// Bridge running: one entry per exposed remote, nothing queued, rescue finds nothing.
+	require.False(t, strings.HasPrefix(StartVFSBridge("rem_a", 0), "error:"))
+	var st struct {
+		Remotes []struct {
+			Remote string `json:"remote"`
+		} `json:"remotes"`
+		QueuedFiles int `json:"queuedFiles"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(VFSBridgeUploadStatus()), &st))
+	require.Len(t, st.Remotes, 1)
+	assert.Equal(t, "rem_a", st.Remotes[0].Remote)
+	assert.Equal(t, 0, st.QueuedFiles)
+
+	var res struct {
+		Rescued []any `json:"rescued"`
+		Skipped []any `json:"skipped"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(RescueVFSBridgePendingUploads(t.TempDir(), true)), &res))
+	assert.Empty(t, res.Rescued)
+	assert.Empty(t, res.Skipped)
+	assert.True(t, strings.HasPrefix(RescueVFSBridgePendingUploads("", true), "error:"))
+	SetVFSBridgeConfirmUploads(true)
+}
