@@ -796,6 +796,8 @@ func TestStoredNameWithoutNormalization(t *testing.T) {
 	dirA := remoteRootID(t, s, "rem_a")
 	mustOK(t, s.handleRequest(req(t, 1, "create",
 		map[string]any{"dirId": dirA, "name": nfd, "isDir": false})), "create")
+	// create's empty placeholder uploads through the write-back queue, a moment later.
+	s.waitForUploads(5 * time.Second)
 	if _, err := os.Stat(filepath.Join(backingA, nfd)); err != nil {
 		t.Fatalf("NFD name not stored verbatim: %v", err)
 	}

@@ -17,6 +17,14 @@ import (
 
 const (
 	maxUploadDelay = 5 * time.Minute // max delay between upload attempts
+
+	// minUploadRetryDelay is the first backoff after a failed upload.
+	//
+	// Enter Space fork: the retry delay starts from --vfs-write-back and doubles, so with
+	// write-back at 0 (a volume that flushes on close) it stayed at 0 and a failing upload
+	// retried in a hot loop, hammering the remote and the CPU. Backoff has to start
+	// somewhere above zero.
+	minUploadRetryDelay = time.Second
 )
 
 // PutFn is the interface that item provides to store the data
@@ -364,7 +372,11 @@ func (wb *WriteBack) upload(ctx context.Context, wbItem *writeBackItem) {
 
 	if err != nil {
 		// FIXME should this have a max number of transfer attempts?
-		wbItem.delay *= 2
+		if wbItem.delay < minUploadRetryDelay {
+			wbItem.delay = minUploadRetryDelay
+		} else {
+			wbItem.delay *= 2
+		}
 		if wbItem.delay > maxUploadDelay {
 			wbItem.delay = maxUploadDelay
 		}

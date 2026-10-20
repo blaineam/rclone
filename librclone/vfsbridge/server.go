@@ -46,6 +46,11 @@ type Server struct {
 	// Buffered to prefetchConcurrency; a non-blocking send is the admission
 	// test, so a full buffer drops the prefetch instead of queueing it.
 	prefetchSlots chan struct{}
+	// confirmUploads makes a write-close wait for that file's upload, and flowControl
+	// holds writes back while too much waits to upload. Both on by default; see
+	// durability.go.
+	confirmUploads atomic.Bool
+	flowControl    atomic.Bool
 }
 
 const (
@@ -67,6 +72,8 @@ func NewServer() *Server {
 	// Start at 1: zero is FSDirectoryVerifierInitial on the FSKit side, which
 	// means "no verifier yet" rather than a generation the module chose.
 	s.generation.Store(1)
+	s.confirmUploads.Store(true)
+	s.flowControl.Store(true)
 	s.rootModTime.Store(time.Now().Unix())
 	return s
 }
@@ -108,12 +115,18 @@ func (s *Server) AddRemote(remoteName string) (retErr error) {
 
 	opt := vfscommon.Opt
 	opt.CacheMode = vfscommon.CacheModeFull
-	// Flush dirty files as soon as their last handle closes, rather than
-	// waiting the default 5s write-back timer. A network volume that reports
-	// close(2) success while the bytes are still only in a local cache is
-	// lying about durability — and is exactly what the FSKit suite's
-	// create-write-read tests catch as "acknowledged but never stored".
-	opt.WriteBack = 0
+	// Upload through the write-back QUEUE, starting almost immediately.
+	//
+	// This was 0, which makes rclone upload INSIDE close(2) (Item.Close treats
+	// WriteBack <= 0 as "synchronous writeback"). That looked like durability, but it
+	// bypassed everything the queue gives: a failed upload was neither retried nor
+	// visible -- the file sat dirty in the cache until the next app launch, i.e. in limbo
+	// -- and a big file's close blocked for the whole upload with no way to see it.
+	//
+	// With a small positive value close(2) queues the upload and returns, the queue
+	// retries a failure with backoff and shows what is pending, and close(2) is made
+	// durable by confirmClose, which waits for that one file's upload.
+	opt.WriteBack = fs.Duration(bridgeWriteBack)
 	opt.DirCacheTime = fs.Duration(5 * time.Minute)
 	opt.PollInterval = fs.Duration(1 * time.Minute)
 
@@ -659,6 +672,10 @@ func (s *Server) dispatch(req *Request) *Response {
 		return s.doClose(req)
 	case "read":
 		return s.doRead(req)
+	case "uploadqueue":
+		return okResp(req.ID, s.UploadStatus())
+	case "rescue":
+		return s.doRescue(req)
 	case "write":
 		return s.doWrite(req)
 	case "access":
@@ -1229,6 +1246,17 @@ func (s *Server) doClose(req *Request) *Response {
 	if handle == nil {
 		return okResp(req.ID, nil)
 	}
+	// Look the file up BEFORE closing: after the last close a reclaim can drop it, and
+	// the wait below needs its VFS and path.
+	var (
+		fileVFS  *vfs.VFS
+		filePath string
+	)
+	if wasWrite {
+		if node := s.inodes.GetNode(args.ItemID); node != nil {
+			fileVFS, filePath = node.VFS(), node.Path()
+		}
+	}
 	if wasWrite {
 		// rclone stores a dirty file only when its LAST open handle closes, so
 		// a lazily-opened read handle on the same item (see doRead) would hold
@@ -1259,7 +1287,17 @@ func (s *Server) doClose(req *Request) *Response {
 	// stalled the full 8s -- and stalled every request queued behind it on
 	// that connection.
 	if wasWrite {
-		s.waitForUploads(closeFlushTimeout)
+		if s.confirmUploads.Load() && fileVFS != nil {
+			// Wait for THIS file's upload, as long as it takes, and fail the close if it
+			// keeps failing: close(2) returning success has to mean the data is on the
+			// remote. The 8s wait below is the legacy bounded one, kept for when this is
+			// switched off or the file cannot be resolved.
+			if errno := s.confirmClose(fileVFS, filePath); errno != 0 {
+				return errorResp(req.ID, errno)
+			}
+		} else {
+			s.waitForUploads(closeFlushTimeout)
+		}
 	}
 	return okResp(req.ID, nil)
 }
@@ -1340,9 +1378,26 @@ func (s *Server) doWrite(req *Request) *Response {
 	if handle == nil {
 		return errorResp(req.ID, cENOENT)
 	}
+	// Back pressure: hold the writer while too many closed files still wait to upload,
+	// so a copy runs at upload speed instead of racing ahead of it.
+	if node := s.inodes.GetNode(args.ItemID); node != nil {
+		s.throttleWrites(node.VFS())
+	}
 	n, err := handle.WriteAt(args.Data, args.Offset)
 	if err != nil {
 		return errorResp(req.ID, mapVFSErr(err))
 	}
 	return okResp(req.ID, n)
+}
+
+// doRescue copies pending uploads to a recovery folder. See RescuePending.
+func (s *Server) doRescue(req *Request) *Response {
+	var args struct {
+		DestDir     string `json:"destDir"`
+		OnlyFailing bool   `json:"onlyFailing"`
+	}
+	if err := json.Unmarshal(req.Args, &args); err != nil || args.DestDir == "" {
+		return errorResp(req.ID, cEINVAL)
+	}
+	return okResp(req.ID, s.RescuePending(args.DestDir, args.OnlyFailing))
 }
