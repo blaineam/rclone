@@ -60,24 +60,29 @@ func payloadOf(n int, fill byte) []byte {
 	return b
 }
 
-// A close that returns success must mean the bytes are on the remote, however long the
-// upload takes. The old close gave up after 8 seconds and reported success anyway.
+// withConfirmTimeout sets how long a close may wait for the rest of the test.
+func withConfirmTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := confirmTimeout
+	confirmTimeout = d
+	t.Cleanup(func() { confirmTimeout = old })
+}
+
+// A close that returns success inside its wait must mean the bytes are on the remote.
 func TestCloseReturnsOnlyOnceTheBytesAreOnTheRemote(t *testing.T) {
-	if testing.Short() {
-		t.Skip("takes ~10s: the upload has to outlast the legacy 8s close wait")
-	}
 	s, backingA, _ := newTestServer(t)
-	slowUploads(t, 40<<10) // 400 KiB at 40 KiB/s: about 10s, longer than closeFlushTimeout
+	withConfirmTimeout(t, 20*time.Second)
+	slowUploads(t, 50<<10) // 200 KiB at 50 KiB/s: about 4s
 	dirA := remoteRootID(t, s, "rem_a")
-	payload := payloadOf(400<<10, 'x')
+	payload := payloadOf(200<<10, 'x')
 	id := createAndWrite(t, s, dirA, "big.bin", payload)
 
 	start := time.Now()
 	mustOK(t, s.handleRequest(req(t, 4, "close", map[string]any{"itemId": id})), "close")
 	took := time.Since(start)
 
-	if took <= closeFlushTimeout {
-		t.Fatalf("close returned after %v, inside the old %v wait: it did not wait for the upload", took, closeFlushTimeout)
+	if took < 2*time.Second {
+		t.Fatalf("close returned after %v: it did not wait for the upload", took)
 	}
 	got, err := os.ReadFile(filepath.Join(backingA, "big.bin"))
 	if err != nil {
@@ -85,6 +90,39 @@ func TestCloseReturnsOnlyOnceTheBytesAreOnTheRemote(t *testing.T) {
 	}
 	if len(got) != len(payload) {
 		t.Fatalf("close reported success with %d of %d bytes on the remote", len(got), len(payload))
+	}
+}
+
+// FSKit fails a volume operation that runs past about 20s, so a close waits only so long.
+// An upload longer than that is accepted: close returns, the file stays queued and shown as
+// uploading, and it still arrives. It must not be reported as an error.
+func TestCloseDoesNotWaitLongerThanFSKitAllows(t *testing.T) {
+	s, backingA, _ := newTestServer(t)
+	withConfirmTimeout(t, time.Second)
+	slowUploads(t, 30<<10) // 150 KiB at 30 KiB/s: about 5s
+	dirA := remoteRootID(t, s, "rem_a")
+	payload := payloadOf(150<<10, 'y')
+	id := createAndWrite(t, s, dirA, "long.bin", payload)
+
+	start := time.Now()
+	mustOK(t, s.handleRequest(req(t, 4, "close", map[string]any{"itemId": id})), "close")
+	if took := time.Since(start); took > 2500*time.Millisecond {
+		t.Fatalf("close waited %v with a 1s limit", took)
+	}
+	st := s.UploadStatus()
+	if st.QueuedFiles != 1 || !st.Remotes[0].Items[0].Uploading {
+		t.Fatalf("after close the file should be queued and uploading, status: %+v", st)
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if got, err := os.ReadFile(filepath.Join(backingA, "long.bin")); err == nil && len(got) == len(payload) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the file never finished uploading after close returned")
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 

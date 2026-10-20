@@ -33,11 +33,6 @@ const (
 	// retrying the file in the background with backoff; this only decides when the
 	// caller is told.
 	confirmFailAfterTries = 3
-	// confirmTimeout bounds how long one close waits. A genuinely long upload is fine;
-	// this is the backstop for one that never completes or fails.
-	confirmTimeout = 30 * time.Minute
-
-	cETIMEDOUT int32 = 60
 
 	// bridgeWriteBack is the delay before a queued upload starts. Not zero: see AddRemote.
 	bridgeWriteBack = time.Millisecond
@@ -45,6 +40,17 @@ const (
 
 // Variables, not constants, so tests can use small values.
 var (
+	// confirmTimeout is how long one close waits for its file's upload.
+	//
+	// FSKit gives up on a volume operation after about 20s and fails the syscall with EIO,
+	// and the module's own request timeout sits just under that, so a close CANNOT wait as
+	// long as a big upload takes: it waits this long, then returns with the file still
+	// queued (visible in the upload queue and retried) rather than letting FSKit kill the
+	// operation with an unattributed error. Uploads that finish inside it are confirmed
+	// before close returns; longer ones are accepted for upload and shown as pending.
+	// Only streaming write-through can make a longer upload block the writer honestly.
+	confirmTimeout = 12 * time.Second
+
 	// writeHighWater is how many bytes may wait to upload before writes are held back.
 	writeHighWater int64 = 512 << 20
 	// writeStallMax bounds how long one write call is held, kept well under the FSKit
@@ -70,8 +76,10 @@ func (s *Server) confirmClose(v *vfs.VFS, path string) int32 {
 		fs.Errorf(nil, "VFS bridge: %q has not uploaded after %d tries; failing the close, the file stays queued and keeps retrying", path, confirmFailAfterTries)
 		return cEIO
 	case errors.Is(err, context.DeadlineExceeded):
-		fs.Errorf(nil, "VFS bridge: %q still uploading after %v; failing the close, the file stays queued", path, confirmTimeout)
-		return cETIMEDOUT
+		// Not an error: the upload is healthy, just longer than a close may wait. It stays
+		// in the queue, shows as uploading, and the app tells the person when it finishes.
+		fs.Infof(nil, "VFS bridge: %q still uploading after %v; close returns, the file stays queued", path, confirmTimeout)
+		return 0
 	default:
 		return cEIO
 	}
