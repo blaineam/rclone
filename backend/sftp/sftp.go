@@ -690,6 +690,7 @@ type Fs struct {
 	// object. It triggers inside NewObject, so a plain log would emit a line
 	// for every file in a sync.
 	statFallbackOnce sync.Once
+	hashPathOnce     sync.Once // the hash-command-cannot-see-path message, once per remote
 	// Same, for the case where LSTAT fails too. Logged separately because a
 	// fallback that silently achieves nothing is indistinguishable from one
 	// that never ran, and that cost a whole build/install/test cycle.
@@ -2432,6 +2433,21 @@ func (o *Object) Hash(ctx context.Context, r hash.Type) (string, error) {
 	}
 	outBytes, err := o.fs.run(ctx, hashCmd+" "+shellPathArg)
 	if err != nil {
+		// The shell cannot see the file at the path SFTP uses for it. That
+		// is a server whose SFTP root is not the shell's root (a chrooted or
+		// home-rooted SFTP, as on a NAS), which path_override exists for.
+		// Reporting it as a hash error here makes every copy to the remote
+		// "corrupted on transfer": the copy's verification treats a hash it
+		// could not compute as a mismatch and deletes the object it just
+		// uploaded. No hash is the honest answer, and what a backend without
+		// hash commands returns: verification is skipped and the upload
+		// stands.
+		if isShellNoSuchFile(err) {
+			o.fs.hashPathOnce.Do(func() {
+				fs.Errorf(o.fs, "%v hash command cannot see %q from the shell (%v) — hashes are unavailable for this remote; set path_override to the shell path of the SFTP root to enable them", r, o.shellPath(), err)
+			})
+			return "", nil
+		}
 		return "", fmt.Errorf("failed to calculate %v hash: %w", r, err)
 	}
 	hashString := parseHash(outBytes)
@@ -2921,3 +2937,10 @@ var (
 	_ fs.Shutdowner     = &Fs{}
 	_ fs.Object         = &Object{}
 )
+
+// isShellNoSuchFile reports whether a shell command failed because the path
+// it was given does not exist in the shell's view of the filesystem.
+func isShellNoSuchFile(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no such file or directory") || strings.Contains(msg, "cannot access")
+}
