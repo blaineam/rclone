@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime/pprof"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,7 +86,25 @@ func NewServer() *Server {
 	s.confirmUploads.Store(true)
 	s.flowControl.Store(true)
 	s.rootModTime.Store(time.Now().Unix())
+	s.inodes.resolve = s.resolvePath
 	return s
+}
+
+// resolvePath finds the node for an inode path ("<remote>" or
+// "<remote>/<path>") on the remote's current VFS. Used by the inode table to
+// carry ids across a VFS replacement (RefreshRemote).
+func (s *Server) resolvePath(path string) (vfs.Node, error) {
+	remote, rest, _ := strings.Cut(path, "/")
+	s.mu.RLock()
+	v := s.vfses[remote]
+	s.mu.RUnlock()
+	if v == nil {
+		return nil, vfs.ENOENT
+	}
+	if rest == "" {
+		return v.Root()
+	}
+	return v.Stat(rest)
 }
 
 // bumpRemoteSet records that the exposed remote set just changed, moving both
@@ -116,11 +135,30 @@ func (s *Server) AddRemote(remoteName string) (retErr error) {
 		return nil
 	}
 
+	v, mode, err := s.buildVFS(remoteName, false)
+	if err != nil {
+		return err
+	}
+	s.vfses[remoteName] = v
+	s.remoteModes[remoteName] = mode
+	s.bumpRemoteSet()
+
+	fs.Infof(nil, "VFS bridge: added remote %q", remoteName)
+	return nil
+}
+
+// buildVFS creates the Fs and the VFS for a remote with the bridge's
+// options. It performs network I/O (fs.NewFs) and does not touch s.vfses;
+// it reads s.writeThrough, which callers protect with s.mu or accept a
+// racy read of.
+// unshared asks for a VFS distinct from any active one for the remote
+// (vfs.NewUnshared), which a replacement needs; an addition reuses.
+func (s *Server) buildVFS(remoteName string, unshared bool) (*vfs.VFS, RemoteMode, error) {
 	// Use fs.NewFs directly instead of cache.Get to avoid the rc/jobs
 	// dependency which requires the RC server to be fully initialized.
 	f, err := fs.NewFs(context.Background(), remoteName+":")
 	if err != nil {
-		return fmt.Errorf("failed to create fs for remote %q: %w", remoteName, err)
+		return nil, RemoteMode{}, fmt.Errorf("failed to create fs for remote %q: %w", remoteName, err)
 	}
 
 	opt := vfscommon.Opt
@@ -222,12 +260,67 @@ func (s *Server) AddRemote(remoteName string) (retErr error) {
 			mode.Note = "This remote can't stream uploads, so writes stay buffered."
 		}
 	}
+	if unshared {
+		return vfs.NewUnshared(vfsCtx, f, &opt), mode, nil
+	}
 	v := vfs.New(vfsCtx, f, &opt)
-	s.vfses[remoteName] = v
-	s.remoteModes[remoteName] = mode
-	s.bumpRemoteSet()
+	return v, mode, nil
+}
 
-	fs.Infof(nil, "VFS bridge: added remote %q", remoteName)
+// RefreshRemote rebuilds a remote's VFS from its current configuration
+// without the remote ever leaving the volume.
+//
+// Removing and re-adding a remote (RemoveRemote, AddRemote) gives every
+// lookup under it in between a not-found answer, which the kernel caches
+// per name: after a config edit on a live remote, folders under it
+// answered ENOENT until the volume was remounted (2026-10-23 11:48). It also
+// hands the new VFS's nodes new ids, so items the module already holds
+// stop resolving.
+//
+// This builds the new VFS first, while the old one keeps serving; swaps it
+// in under the lock; marks the subtree's ids stale so each re-resolves by
+// path on the new VFS when next used, keeping its id; closes the handles
+// that were open on the old VFS (a read reopens lazily on the new one; a
+// writer sees the same close it saw on a toggle); then flushes the old
+// VFS's pending uploads and shuts it down. A remote not yet exposed is
+// simply added.
+func (s *Server) RefreshRemote(remoteName string) (retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			retErr = fmt.Errorf("panic in RefreshRemote(%q): %v", remoteName, r)
+			fs.Errorf(nil, "VFS bridge: %v", retErr)
+		}
+	}()
+	s.mu.RLock()
+	_, exists := s.vfses[remoteName]
+	s.mu.RUnlock()
+	if !exists {
+		return s.AddRemote(remoteName)
+	}
+	newVFS, mode, err := s.buildVFS(remoteName, true)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	old := s.vfses[remoteName]
+	s.vfses[remoteName] = newVFS
+	s.remoteModes[remoteName] = mode
+	s.inodes.MarkSubtreeStale(remoteName)
+	s.bumpRemoteSet()
+	s.mu.Unlock()
+
+	for _, id := range s.inodes.SubtreeIDs(remoteName) {
+		for _, h := range s.handles.PopAll(id) {
+			if err := h.Close(); err != nil {
+				fs.Errorf(nil, "VFS bridge: closing handle on item %d of refreshed remote %q: %v", id, remoteName, err)
+			}
+		}
+	}
+	if old != nil {
+		s.waitForWriteback([]*vfs.VFS{old}, removeFlushTimeout, (*vfs.VFS).PendingWriteback)
+		old.Shutdown()
+	}
+	fs.Infof(nil, "VFS bridge: refreshed remote %q in place", remoteName)
 	return nil
 }
 

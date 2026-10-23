@@ -1,10 +1,12 @@
 package vfsbridge
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/vfs"
 )
 
@@ -19,6 +21,11 @@ type InodeTable struct {
 	idToNode map[uint64]vfs.Node
 	idToPath map[uint64]string
 	pathToID map[string]uint64
+	// stale holds ids whose node belongs to a VFS that has been replaced
+	// (see MarkSubtreeStale); GetNode re-resolves them by path through
+	// resolve before answering, so the id survives the replacement.
+	stale   map[uint64]bool
+	resolve func(path string) (vfs.Node, error)
 }
 
 // NewInodeTable creates a new inode table.
@@ -27,6 +34,7 @@ func NewInodeTable() *InodeTable {
 		idToNode: make(map[uint64]vfs.Node),
 		idToPath: make(map[uint64]string),
 		pathToID: make(map[string]uint64),
+		stale:    make(map[uint64]bool),
 	}
 	// Start after reserved IDs
 	t.nextID.Store(RootInodeID + 1)
@@ -83,8 +91,69 @@ func (t *InodeTable) Assign(node vfs.Node, path string) uint64 {
 // GetNode returns the VFS node for the given inode ID.
 func (t *InodeTable) GetNode(id uint64) vfs.Node {
 	t.mu.RLock()
+	node := t.idToNode[id]
+	stale := t.stale[id]
+	path := t.idToPath[id]
+	t.mu.RUnlock()
+	if !stale || t.resolve == nil {
+		return node
+	}
+	// The node belongs to a VFS that has been replaced. Resolve the same
+	// path on the current one, off the lock: this can list a directory on
+	// the backend. A path the new VFS does not have is gone; any other
+	// failure keeps the old node, whose operations fail as a shut-down VFS
+	// fails them, rather than answering not-found for a path that exists.
+	fresh, err := t.resolve(path)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.stale[id] {
+		return t.idToNode[id] // someone else resolved it meanwhile
+	}
+	switch {
+	case err == nil:
+		t.idToNode[id] = fresh
+		delete(t.stale, id)
+		return fresh
+	case errors.Is(err, vfs.ENOENT), errors.Is(err, fs.ErrorObjectNotFound), errors.Is(err, fs.ErrorDirNotFound):
+		if t.pathToID[path] == id {
+			delete(t.pathToID, path)
+		}
+		delete(t.idToNode, id)
+		delete(t.idToPath, id)
+		delete(t.stale, id)
+		return nil
+	default:
+		return node
+	}
+}
+
+// MarkSubtreeStale marks the remote's root id and every id below it as
+// belonging to a replaced VFS, so the next GetNode on each re-resolves it by
+// path on the current one. The ids themselves do not change: a client that
+// holds them keeps working across the replacement.
+func (t *InodeTable) MarkSubtreeStale(remote string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	prefix := remote + "/"
+	for id, path := range t.idToPath {
+		if path == remote || strings.HasPrefix(path, prefix) {
+			t.stale[id] = true
+		}
+	}
+}
+
+// SubtreeIDs returns the remote's root id and every id below it.
+func (t *InodeTable) SubtreeIDs(remote string) []uint64 {
+	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.idToNode[id]
+	prefix := remote + "/"
+	ids := make([]uint64, 0)
+	for id, path := range t.idToPath {
+		if path == remote || strings.HasPrefix(path, prefix) {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // GetPath returns the path for the given inode ID.
@@ -151,6 +220,7 @@ func (t *InodeTable) UnbindSubtree(remote string) []uint64 {
 		}
 		unbound = append(unbound, id)
 		delete(t.idToNode, id)
+		delete(t.stale, id)
 	}
 	return unbound
 }
@@ -208,4 +278,5 @@ func (t *InodeTable) Remove(id uint64) {
 	}
 	delete(t.idToNode, id)
 	delete(t.idToPath, id)
+	delete(t.stale, id)
 }

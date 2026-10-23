@@ -206,6 +206,20 @@ var (
 // the config in the context (if any) and filter config in the context
 // (if any).
 func New(ctx context.Context, f fs.Fs, opt *vfscommon.Options) *VFS {
+	return newVFS(ctx, f, opt, true)
+}
+
+// NewUnshared creates a new VFS and root directory like New, but never
+// returns an active VFS for the same remote and options: the caller gets a
+// VFS built on the Fs it passed, even while another VFS for that remote is
+// still running. That is what replacing a remote's VFS in place needs, where
+// the old one serves until the new one is ready and the two must be
+// distinct.
+func NewUnshared(ctx context.Context, f fs.Fs, opt *vfscommon.Options) *VFS {
+	return newVFS(ctx, f, opt, false)
+}
+
+func newVFS(ctx context.Context, f fs.Fs, opt *vfscommon.Options, reuseActive bool) *VFS {
 	fsDir := fs.NewDir("", time.Now())
 	// Strip the ctx of any cancellation but copy the config across
 	newCtx := context.Background()
@@ -233,13 +247,15 @@ func New(ctx context.Context, f fs.Fs, opt *vfscommon.Options) *VFS {
 	activeMu.Lock()
 	defer activeMu.Unlock()
 	configName := fs.ConfigString(f)
-	for _, activeVFS := range active[configName] {
-		// A VFS whose last reference has gone is being shut down
-		// but may not have removed itself from the cache yet.
-		if vfs.Opt == activeVFS.Opt && activeVFS.Hold() {
-			fs.Debugf(f, "Reusing VFS from active cache")
-			cancel()
-			return activeVFS
+	if reuseActive {
+		for _, activeVFS := range active[configName] {
+			// A VFS whose last reference has gone is being shut down
+			// but may not have removed itself from the cache yet.
+			if vfs.Opt == activeVFS.Opt && activeVFS.Hold() {
+				fs.Debugf(f, "Reusing VFS from active cache")
+				cancel()
+				return activeVFS
+			}
 		}
 	}
 	// Put the VFS into the active cache

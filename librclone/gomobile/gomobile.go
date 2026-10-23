@@ -117,6 +117,29 @@ func RemoveVFSBridgeRemote(remoteName string) string {
 	return ""
 }
 
+// RefreshVFSBridgeRemote rebuilds a remote's VFS from its current
+// configuration without the remote leaving the volume: the ids the module
+// holds keep resolving and no lookup under it answers not-found meanwhile.
+// Use this after a config edit on a remote that is part of the volume,
+// instead of RemoveVFSBridgeRemote + StartVFSBridge, which leave a window in
+// which every path under the remote is absent and the kernel caches that.
+// Returns "" on success or "error: <reason>". A remote not yet exposed is
+// added.
+// Exported as RcloneRefreshVFSBridgeRemote
+func RefreshVFSBridgeRemote(remoteName string) string {
+	bridgeMu.Lock()
+	server := bridgeServer
+	bridgeMu.Unlock()
+
+	if server == nil {
+		return "error: bridge not running"
+	}
+	if err := server.RefreshRemote(remoteName); err != nil {
+		return "error: " + err.Error()
+	}
+	return ""
+}
+
 // VFSBridgeGeneration returns a counter that changes whenever the set of
 // remotes the bridge exposes changes. Zero when no bridge is running.
 // Exported as RcloneVFSBridgeGeneration
