@@ -304,6 +304,40 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	return fs.ErrorCantPurge
 }
 
+// OpenRangeWriter opens an existing object on the wrapped Fs for writes at
+// arbitrary offsets. The stored hashes describe the bytes before the edit, so
+// they are dropped when the handle opens and again when it closes.
+func (f *Fs) OpenRangeWriter(ctx context.Context, remote string) (fs.RangeWriter, error) {
+	do := f.Fs.Features().OpenRangeWriter
+	if do == nil {
+		return nil, fs.ErrorNotImplemented
+	}
+	w, err := do(ctx, remote)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.pruneHash(remote); err != nil {
+		fs.Debugf(f, "OpenRangeWriter: pruning hashes of %q: %v", remote, err)
+	}
+	return &rangeWriter{RangeWriter: w, f: f, remote: remote}, nil
+}
+
+// rangeWriter is the wrapped Fs's RangeWriter with the hash store kept honest.
+type rangeWriter struct {
+	fs.RangeWriter
+	f      *Fs
+	remote string
+}
+
+// Close closes the wrapped handle and drops any hash stored meanwhile.
+func (w *rangeWriter) Close() error {
+	err := w.RangeWriter.Close()
+	if pruneErr := w.f.pruneHash(w.remote); pruneErr != nil {
+		fs.Debugf(w.f, "OpenRangeWriter: pruning hashes of %q after close: %v", w.remote, pruneErr)
+	}
+	return err
+}
+
 // PutStream uploads to the remote path with undeterminate size.
 func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	if do := f.Fs.Features().PutStream; do != nil {
@@ -604,4 +638,5 @@ var (
 	_ fs.Disconnecter    = (*Fs)(nil)
 	_ fs.Shutdowner      = (*Fs)(nil)
 	_ fs.FullObject      = (*Object)(nil)
+	_ fs.OpenRangeWriter = (*Fs)(nil)
 )

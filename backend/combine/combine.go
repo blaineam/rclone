@@ -1057,6 +1057,21 @@ func (f *Fs) CleanUp(ctx context.Context) error {
 	})
 }
 
+// OpenRangeWriter opens an existing object on the upstream that holds it
+// for writes at arbitrary offsets. A combine passes bytes through untouched,
+// so the upstream's ranged write is the file's ranged write.
+func (f *Fs) OpenRangeWriter(ctx context.Context, remote string) (fs.RangeWriter, error) {
+	u, uRemote, err := f.findUpstream(remote)
+	if err != nil {
+		return nil, err
+	}
+	do := u.f.Features().OpenRangeWriter
+	if do == nil {
+		return nil, fs.ErrorNotImplemented
+	}
+	return do(ctx, uRemote)
+}
+
 // OpenWriterAt opens with a handle for random access writes
 //
 // Pass in the remote desired and the size if known.
@@ -1193,5 +1208,6 @@ var (
 	_ fs.MkdirMetadataer = (*Fs)(nil)
 	_ fs.CleanUpper      = (*Fs)(nil)
 	_ fs.OpenWriterAter  = (*Fs)(nil)
+	_ fs.OpenRangeWriter = (*Fs)(nil)
 	_ fs.FullObject      = (*Object)(nil)
 )

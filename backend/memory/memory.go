@@ -675,6 +675,93 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	return nil
 }
 
+// OpenRangeWriter opens an existing object for writes at arbitrary offsets:
+// the object is a byte slice, so a positioned write is a copy into it.
+func (f *Fs) OpenRangeWriter(ctx context.Context, remote string) (fs.RangeWriter, error) {
+	if f.opt.Discard {
+		return nil, errors.New("can't edit in place with --memory-discard")
+	}
+	obj, err := f.NewObject(ctx, remote)
+	if err != nil {
+		return nil, err
+	}
+	return &rangeWriter{o: obj.(*Object)}, nil
+}
+
+// rangeWriter is the fs.RangeWriter for a memory object.
+type rangeWriter struct {
+	mu sync.Mutex
+	o  *Object
+}
+
+// edit replaces the object's data with fn's result, under the bucket lock.
+func (w *rangeWriter) edit(fn func(data []byte) []byte) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	bucket, bucketPath := w.o.split()
+	old := w.o.od
+	data := fn(append([]byte(nil), old.data...))
+	h := md5.Sum(data)
+	w.o.od = &objectData{
+		data:     data,
+		size:     int64(len(data)),
+		hash:     hex.EncodeToString(h[:]),
+		modTime:  time.Now(),
+		mimeType: old.mimeType,
+	}
+	buckets.updateObjectData(bucket, bucketPath, w.o.od)
+}
+
+// WriteAt writes p at off, growing the object as needed.
+func (w *rangeWriter) WriteAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, errors.New("negative offset")
+	}
+	w.edit(func(data []byte) []byte {
+		if end := off + int64(len(p)); end > int64(len(data)) {
+			data = append(data, make([]byte, end-int64(len(data)))...)
+		}
+		copy(data[off:], p)
+		return data
+	})
+	return len(p), nil
+}
+
+// ReadAt reads len(p) bytes at off.
+func (w *rangeWriter) ReadAt(p []byte, off int64) (int, error) {
+	w.mu.Lock()
+	data := w.o.od.data
+	w.mu.Unlock()
+	if off >= int64(len(data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// Truncate sets the object's size.
+func (w *rangeWriter) Truncate(size int64) error {
+	if size < 0 {
+		return errors.New("negative size")
+	}
+	w.edit(func(data []byte) []byte {
+		if size <= int64(len(data)) {
+			return data[:size]
+		}
+		return append(data, make([]byte, size-int64(len(data)))...)
+	})
+	return nil
+}
+
+// Sync is a no-op: there is nothing beyond memory.
+func (w *rangeWriter) Sync() error { return nil }
+
+// Close is a no-op: every write was applied as it came.
+func (w *rangeWriter) Close() error { return nil }
+
 // Remove an object
 func (o *Object) Remove(ctx context.Context) error {
 	bucket, bucketPath := o.split()
@@ -692,11 +779,12 @@ func (o *Object) MimeType(ctx context.Context) string {
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs          = &Fs{}
-	_ fs.Copier      = &Fs{}
-	_ fs.PutStreamer = &Fs{}
-	_ fs.ListRer     = &Fs{}
-	_ fs.ListPer     = &Fs{}
-	_ fs.Object      = &Object{}
-	_ fs.MimeTyper   = &Object{}
+	_ fs.Fs              = &Fs{}
+	_ fs.Copier          = &Fs{}
+	_ fs.PutStreamer     = &Fs{}
+	_ fs.ListRer         = &Fs{}
+	_ fs.ListPer         = &Fs{}
+	_ fs.Object          = &Object{}
+	_ fs.MimeTyper       = &Object{}
+	_ fs.OpenRangeWriter = &Fs{}
 )

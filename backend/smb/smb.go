@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/cloudsoda/go-smb2"
 	"io"
 	"os"
 	"path"
@@ -777,6 +778,135 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 
 	return in, nil
+}
+
+// OpenRangeWriter opens an existing file for writes at arbitrary offsets:
+// SMB2 WRITE carries the offset, so an in-place edit costs the bytes written.
+// The connection is held for the life of the handle, as Update does.
+func (f *Fs) OpenRangeWriter(ctx context.Context, remote string) (fs.RangeWriter, error) {
+	obj, err := f.NewObject(ctx, remote)
+	if err != nil {
+		return nil, err
+	}
+	o := obj.(*Object)
+	share, filename := o.split()
+	if share == "" || filename == "" {
+		return nil, fs.ErrorIsDir
+	}
+	filename = f.toSambaPath(filename)
+	f.addSession() // Show session in use
+	cn, err := f.getConnection(ctx, share)
+	if err != nil {
+		f.removeSession()
+		return nil, err
+	}
+	fl, err := cn.smbShare.OpenFile(filename, os.O_RDWR, 0o644)
+	if err != nil {
+		f.putConnection(&cn, err)
+		f.removeSession()
+		return nil, fmt.Errorf("OpenRangeWriter: failed to open: %w", err)
+	}
+	return &rangeWriter{o: o, cn: cn, fl: fl, filename: filename}, nil
+}
+
+// rangeWriter is the fs.RangeWriter for an SMB file.
+type rangeWriter struct {
+	o        *Object
+	cn       *conn
+	fl       *smb2.File
+	filename string
+	mu       sync.Mutex
+	err      error // first error, decides whether the connection is reused
+	closed   bool
+}
+
+// WriteAt writes p at off.
+func (w *rangeWriter) WriteAt(p []byte, off int64) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return 0, os.ErrClosed
+	}
+	n, err := w.fl.WriteAt(p, off)
+	if err != nil {
+		w.remember(err)
+		return n, fmt.Errorf("OpenRangeWriter: write at %d failed: %w", off, err)
+	}
+	return n, nil
+}
+
+// ReadAt reads len(p) bytes at off.
+func (w *rangeWriter) ReadAt(p []byte, off int64) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return 0, os.ErrClosed
+	}
+	n, err := w.fl.ReadAt(p, off)
+	if err != nil && err != io.EOF {
+		w.remember(err)
+	}
+	return n, err
+}
+
+// Truncate sets the file's size.
+func (w *rangeWriter) Truncate(size int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return os.ErrClosed
+	}
+	if err := w.fl.Truncate(size); err != nil {
+		w.remember(err)
+		return fmt.Errorf("OpenRangeWriter: truncate to %d failed: %w", size, err)
+	}
+	return nil
+}
+
+// Sync asks the server to flush the file to disk (SMB2 FLUSH).
+func (w *rangeWriter) Sync() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return os.ErrClosed
+	}
+	if err := w.fl.Sync(); err != nil {
+		w.remember(err)
+		return fmt.Errorf("OpenRangeWriter: sync failed: %w", err)
+	}
+	return nil
+}
+
+// Close releases the handle and the connection and re-reads the file's
+// size and modtime.
+func (w *rangeWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return os.ErrClosed
+	}
+	w.closed = true
+	defer w.o.fs.removeSession()
+	err := w.fl.Close()
+	if err != nil {
+		w.remember(err)
+		err = fmt.Errorf("OpenRangeWriter: close failed: %w", err)
+	}
+	if w.err == nil {
+		if fi, statErr := w.cn.smbShare.Stat(w.filename); statErr == nil {
+			w.o.statResult = fi
+		} else if err == nil {
+			err = fmt.Errorf("OpenRangeWriter: stat after close failed: %w", statErr)
+		}
+	}
+	w.o.fs.putConnection(&w.cn, w.err)
+	return err
+}
+
+func (w *rangeWriter) remember(err error) {
+	if w.err == nil {
+		w.err = err
+	}
 }
 
 // Update the Object from in with modTime and size

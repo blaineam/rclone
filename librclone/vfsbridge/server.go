@@ -60,7 +60,11 @@ type Server struct {
 	// writeThrough holds, per remote, whether the person asked for streaming writes, and
 	// remoteModes what each exposed remote actually got. Guarded by mu.
 	writeThrough map[string]bool
-	remoteModes  map[string]RemoteMode
+	// inPlaceOff holds, per remote, the person's choice NOT to edit existing files in
+	// place with ranged writes on a streaming remote. Absent means on: it is the
+	// default wherever the backend can write at an offset (SetInPlaceEdits).
+	inPlaceOff  map[string]bool
+	remoteModes map[string]RemoteMode
 }
 
 const (
@@ -79,6 +83,7 @@ func NewServer() *Server {
 		handles:       NewHandleTable(),
 		prefetchSlots: make(chan struct{}, prefetchConcurrency),
 		writeThrough:  make(map[string]bool),
+		inPlaceOff:    make(map[string]bool),
 		remoteModes:   make(map[string]RemoteMode),
 	}
 	// Start at 1: zero is FSDirectoryVerifierInitial on the FSKit side, which
@@ -259,8 +264,11 @@ func (s *Server) buildVFS(remoteName string, unshared bool) (*vfs.VFS, RemoteMod
 			// writes, so a few MB of tags patched into a 2.5 GB film cost a few MB,
 			// not a refusal and not the film. Where the backend cannot (object
 			// stores, crypt), the open stays EPERM and the VFS logs why.
-			opt.RangeWrites = true
-			mode.InPlace = f.Features().OpenRangeWriter != nil
+			opt.RangeWrites = !s.inPlaceOff[remoteName]
+			mode.InPlace = opt.RangeWrites && f.Features().OpenRangeWriter != nil
+			if opt.RangeWrites && !mode.InPlace {
+				mode.Note = "Files on this remote can be replaced but not edited in place: its storage cannot write at an offset."
+			}
 			// rclone reads the stream through an async buffer (16MiB by default), which would
 			// let the writer run that far ahead of the upload and leave close waiting out the
 			// tail. Keep it small.

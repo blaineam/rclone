@@ -22,7 +22,7 @@ func TestIntegration(t *testing.T) {
 		RemoteName: *fstest.RemoteName,
 		NilObject:  (*hasher.Object)(nil),
 		UnimplementableFsMethods: []string{
-			"OpenWriterAt", "OpenRangeWriter",
+			"OpenWriterAt",
 			"OpenChunkWriter",
 		},
 		UnimplementableObjectMethods: []string{},

@@ -237,8 +237,9 @@ open for writing that does not truncate it (an in-place edit) fails with
 EPERM.
 
 The `--vfs-range-writes` flag lets such an open succeed on backends whose
-storage can write at an offset (`local`, `sftp`: the `OpenRangeWriter`
-feature). Each write then goes to the backend as a positioned write of
+storage can write at an offset (the `OpenRangeWriter` feature: `local`,
+`sftp`, `smb`, `azurefiles`, `memory`, and `alias`, `combine`, `hasher` and
+`archive` over one of those). Each write then goes to the backend as a positioned write of
 exactly the bytes written, a write past the end extends the file, truncate
 sets its size, and `fsync` returns once the backend has the bytes on
 stable storage where it can promise that (SFTP servers with the
@@ -250,10 +251,10 @@ being copied in, between its creation and its first write) streams as
 before, and a second open for writing while that stream is in flight gets
 the handle it always got.
 
-Backends that cannot write at an offset (object stores, and the `crypt`,
-`compress` and `chunker` wrappers, where a byte patch would break the
-stored form) still refuse the open with EPERM, and the log says which
-backend refused. Cache modes other than `off` are unaffected: they edit
+Backends that cannot write at an offset (object stores, `ftp`, `webdav`,
+`hdfs`, and the `crypt`, `compress`, `chunker` and `union` wrappers, where a
+byte patch would break the stored form or has no single home) still refuse
+the open with EPERM, and the log says which backend refused. Cache modes other than `off` are unaffected: they edit
 the cached copy and upload the whole file on close as before.
 
 ### VFS Chunked Reading

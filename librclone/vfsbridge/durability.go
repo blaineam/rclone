@@ -80,6 +80,19 @@ type RemoteMode struct {
 	InPlace bool `json:"inPlace,omitempty"`
 }
 
+// SetInPlaceEdits records whether existing files on remote may be edited in place with
+// ranged writes when it streams (the default is yes wherever the backend can write at an
+// offset). Like SetWriteThrough it applies the next time the remote is added or refreshed.
+func (s *Server) SetInPlaceEdits(remote string, on bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if on {
+		delete(s.inPlaceOff, remote)
+	} else {
+		s.inPlaceOff[remote] = true
+	}
+}
+
 // SetWriteThrough records whether remote should stream its writes. It applies the next
 // time the remote is added to the volume (the app removes and re-adds it, which flushes
 // whatever is pending first), so changing it never disturbs a transfer in flight.

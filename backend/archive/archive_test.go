@@ -13,7 +13,7 @@ import (
 )
 
 var (
-	unimplementableFsMethods = []string{"ListR", "ListP", "MkdirMetadata", "DirSetModTime", "OpenRangeWriter"}
+	unimplementableFsMethods = []string{"ListR", "ListP", "MkdirMetadata", "DirSetModTime"}
 	// In these tests we receive objects from the underlying remote which don't implement these methods
 	unimplementableObjectMethods = []string{"GetTier", "ID", "Metadata", "MimeType", "SetTier", "UnWrap", "SetMetadata"}
 )

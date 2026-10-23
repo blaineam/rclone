@@ -431,3 +431,59 @@ func TestMeasureNASInPlace(t *testing.T) {
 	t.Logf("in-place edit of a %d MiB file: %d bytes patched in %v; writing the file whole took %v",
 		mib, len(block)+len(patch), total.Round(time.Millisecond), whole.Round(time.Millisecond))
 }
+
+// TestMeasureSMBInPlace is TestMeasureNASInPlace against an SMB share named by
+// ES_VFSBRIDGE_SMB (rclone.conf keys for an smb remote, e.g.
+// "host=10.0.0.20,user=blaine,pass=<obscured>"); ES_VFSBRIDGE_NAS_WRITE_DIR
+// names the share and directory to write into. Not run here: this Mac has no
+// SMB server to serve a loopback share without changing system settings.
+func TestMeasureSMBInPlace(t *testing.T) {
+	spec := os.Getenv("ES_VFSBRIDGE_SMB")
+	if spec == "" {
+		t.Skip("set ES_VFSBRIDGE_SMB to run the SMB in-place edit measurement")
+	}
+	relDir := os.Getenv("ES_VFSBRIDGE_NAS_WRITE_DIR")
+	if relDir == "" {
+		t.Fatal("set ES_VFSBRIDGE_NAS_WRITE_DIR to share/dir to write into")
+	}
+	tmp := t.TempDir()
+	confPath := filepath.Join(tmp, "rclone.conf")
+	var conf strings.Builder
+	conf.WriteString("[nas]\ntype = smb\n")
+	for _, kv := range strings.Split(spec, ",") {
+		k, v, _ := strings.Cut(kv, "=")
+		fmt.Fprintf(&conf, "%s = %s\n", strings.TrimSpace(k), strings.TrimSpace(v))
+	}
+	if err := os.WriteFile(confPath, []byte(conf.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.SetConfigPath(confPath)
+	configfile.Install()
+	useTempCacheDir(t)
+
+	s := NewServer()
+	s.SetWriteThrough("nas", true)
+	if err := s.AddRemote("nas"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Stop)
+	if modeOf(s, "nas") != "through" || !inPlaceOf(s, "nas") {
+		t.Fatalf("nas: mode %q in-place %v, want through + in-place", modeOf(s, "nas"), inPlaceOf(s, "nas"))
+	}
+	dir := remoteRootID(t, s, "nas")
+	for _, p := range strings.Split(relDir, "/") {
+		dir = childID(t, s, dir, p)
+	}
+	name := "es-inplace-probe.bin"
+	r := mustOK(t, s.handleRequest(req(t, 1, "create", map[string]any{"dirId": dir, "name": name, "isDir": false})), "create")
+	id := r.Result.(ItemInfo).ID
+	t.Cleanup(func() {
+		mustOK(t, s.handleRequest(req(t, 99, "remove", map[string]any{"dirId": dir, "itemId": id, "name": name})), "remove the probe")
+	})
+	mustOK(t, s.handleRequest(req(t, 2, "open", map[string]any{"itemId": id, "write": true})), "open")
+	mustOK(t, s.handleRequest(req(t, 3, "write", map[string]any{"itemId": id, "offset": 0, "data": payloadOf(8<<20, 'x')})), "write")
+	mustOK(t, s.handleRequest(req(t, 4, "close", map[string]any{"itemId": id})), "close")
+	t0 := time.Now()
+	latheSequence(t, s, id, 8<<20, payloadOf(2500<<10, 'M'), []byte{0, 0, 0, 8, 'f', 'r', 'e', 'e'}, 4<<20, (8<<20)+(2500<<10)-(300<<10))
+	t.Logf("SMB in-place edit, 2.5 MB patched into an 8 MiB file: %v", time.Since(t0).Round(time.Millisecond))
+}

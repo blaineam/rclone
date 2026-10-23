@@ -22,7 +22,9 @@ var (
 	bridgeServer *vfsbridge.Server
 	// pendingWriteThrough holds streaming-write choices made before the bridge started.
 	pendingWriteThrough = map[string]bool{}
-	bridgeMu            sync.Mutex
+	// pendingInPlace holds in-place-edit choices made before the bridge started.
+	pendingInPlace = map[string]bool{}
+	bridgeMu       sync.Mutex
 )
 
 // Initialize initializes rclone as a library
@@ -72,6 +74,9 @@ func StartVFSBridge(remoteName string, port int) string {
 		bridgeServer = vfsbridge.NewServer()
 		for name, on := range pendingWriteThrough {
 			bridgeServer.SetWriteThrough(name, on)
+		}
+		for name, on := range pendingInPlace {
+			bridgeServer.SetInPlaceEdits(name, on)
 		}
 		addr := fmt.Sprintf("localhost:%d", port)
 		listenAddr, err := bridgeServer.Start(addr)
@@ -213,6 +218,23 @@ func SetVFSBridgeWriteThrough(remoteName string, on bool) {
 		return
 	}
 	bridgeServer.SetWriteThrough(remoteName, on)
+}
+
+// SetVFSBridgeInPlaceEdits chooses whether existing files on remoteName may be edited in
+// place with ranged writes when the remote streams its writes. On is the default wherever
+// the remote's storage can write at an offset (SFTP, SMB, local folders, Azure Files); off
+// makes such an open fail and the file replaceable only whole, as before. Takes effect the
+// next time the remote is added to or refreshed on the volume.
+// Exported as RcloneSetVFSBridgeInPlaceEdits
+func SetVFSBridgeInPlaceEdits(remoteName string, on bool) {
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
+
+	if bridgeServer == nil {
+		pendingInPlace[remoteName] = on
+		return
+	}
+	bridgeServer.SetInPlaceEdits(remoteName, on)
 }
 
 // SetVFSBridgeConfirmUploads chooses whether closing a written file waits for its

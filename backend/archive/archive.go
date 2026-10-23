@@ -646,6 +646,20 @@ func (f *Fs) OpenWriterAt(ctx context.Context, remote string, size int64) (fs.Wr
 	return do(ctx, remote, size)
 }
 
+// OpenRangeWriter opens an existing object on the wrapped Fs for writes at
+// arbitrary offsets. Files inside an archive are read-only views and cannot
+// be edited; everything else passes through untouched.
+func (f *Fs) OpenRangeWriter(ctx context.Context, remote string) (fs.RangeWriter, error) {
+	if f.findArchive(remote) != nil {
+		return nil, fs.ErrorPermissionDenied
+	}
+	do := f.f.Features().OpenRangeWriter
+	if do == nil {
+		return nil, fs.ErrorNotImplemented
+	}
+	return do(ctx, remote)
+}
+
 // UnWrap returns the Fs that this Fs is wrapping
 func (f *Fs) UnWrap() fs.Fs {
 	return f.f
@@ -712,4 +726,5 @@ var (
 	_ fs.UserInfoer      = (*Fs)(nil)
 	_ fs.Disconnecter    = (*Fs)(nil)
 	// FIXME _ fs.FullObject      = (*Object)(nil)
+	_ fs.OpenRangeWriter = (*Fs)(nil)
 )

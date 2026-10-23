@@ -999,6 +999,47 @@ func (w *writerAt) Close() error {
 	return nil
 }
 
+// OpenRangeWriter opens an existing file for writes at arbitrary offsets:
+// Azure Files' Put Range writes a byte range of a file in place and Resize
+// sets its length, so an in-place edit costs the bytes written.
+func (f *Fs) OpenRangeWriter(ctx context.Context, remote string) (fs.RangeWriter, error) {
+	obj, err := f.NewObject(ctx, remote)
+	if err != nil {
+		return nil, err
+	}
+	o := obj.(*Object)
+	return &rangeWriter{
+		writerAt: writerAt{ctx: ctx, f: f, fc: o.fileClient(), size: o.Size()},
+		o:        o,
+	}, nil
+}
+
+// rangeWriter is writerAt (Put Range, growing the file as needed) on an
+// existing object, with Truncate, Sync and a Close that re-reads the object.
+type rangeWriter struct {
+	writerAt
+	o *Object
+}
+
+// Truncate sets the file's length.
+func (w *rangeWriter) Truncate(size int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, err := w.fc.Resize(w.ctx, size, nil); err != nil {
+		return fmt.Errorf("OpenRangeWriter: resize to %d failed: %w", size, err)
+	}
+	w.size = size
+	return nil
+}
+
+// Sync is a no-op: each Put Range is durable when it returns.
+func (w *rangeWriter) Sync() error { return nil }
+
+// Close re-reads the object's properties so its size and modtime are current.
+func (w *rangeWriter) Close() error {
+	return w.o.getMetadata(w.ctx)
+}
+
 // OpenWriterAt opens with a handle for random access writes
 //
 // Pass in the remote desired and the size if known.
@@ -1040,14 +1081,15 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs             = &Fs{}
-	_ fs.PutStreamer    = &Fs{}
-	_ fs.Abouter        = &Fs{}
-	_ fs.Mover          = &Fs{}
-	_ fs.DirMover       = &Fs{}
-	_ fs.Copier         = &Fs{}
-	_ fs.OpenWriterAter = &Fs{}
-	_ fs.ListPer        = &Fs{}
-	_ fs.Object         = &Object{}
-	_ fs.MimeTyper      = &Object{}
+	_ fs.Fs              = &Fs{}
+	_ fs.PutStreamer     = &Fs{}
+	_ fs.Abouter         = &Fs{}
+	_ fs.Mover           = &Fs{}
+	_ fs.DirMover        = &Fs{}
+	_ fs.Copier          = &Fs{}
+	_ fs.OpenWriterAter  = &Fs{}
+	_ fs.OpenRangeWriter = &Fs{}
+	_ fs.ListPer         = &Fs{}
+	_ fs.Object          = &Object{}
+	_ fs.MimeTyper       = &Object{}
 )

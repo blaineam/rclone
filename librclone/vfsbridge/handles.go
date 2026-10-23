@@ -120,12 +120,22 @@ func (t *HandleTable) GetForRead(itemID uint64) vfs.Handle {
 }
 
 // getForRead returns the entry GetForRead would pick, with its read-ahead state.
+//
+// While an in-place edit (vfs.RangeFileHandle) is open on the item, reads go
+// through it: it reads the live object on the remote, so a reader sees the
+// bytes written so far. Any other read handle reads through its own buffer,
+// which may hold bytes from before a patch.
 func (t *HandleTable) getForRead(itemID uint64) *handleEntry {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	entries := t.handles[itemID]
 	if len(entries) == 0 {
 		return nil
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		if _, ok := entries[i].h.(*vfs.RangeFileHandle); ok {
+			return entries[i]
+		}
 	}
 	return entries[len(entries)-1]
 }
