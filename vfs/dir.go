@@ -38,6 +38,9 @@ type Dir struct {
 	read    time.Time         // time directory entry last read
 	items   map[string]Node   // directory entries - can be empty but not nil
 	virtual map[string]vState // virtual directory entries - may be nil
+	// refreshing is set while a background re-listing of a stale directory
+	// is in flight, so only one runs at a time. See _readDir.
+	refreshing bool
 
 	modTimeMu sync.Mutex // protects the following
 	modTime   time.Time
@@ -537,7 +540,47 @@ func (d *Dir) _readDir() error {
 	} else {
 		return nil
 	}
+	// A directory that has been listed before is served from what it has and
+	// re-listed in the background. The alternative, re-listing here with
+	// d.mu held, puts one backend round trip on the request path of every
+	// lookup, stat and readdir in the directory once DirCacheTime has passed,
+	// and holds every other caller on the lock for as long as the backend
+	// takes; on a loaded SFTP server a 230-entry listing takes seconds, and
+	// callers with a bounded wait (FSKit's volume operations) time out on a
+	// listing that was merely slow. The entries served meanwhile are at most
+	// DirCacheTime plus one listing old, which is the staleness the cache
+	// already allows. A directory never listed before still lists here.
+	if !d.read.IsZero() && len(d.items) > 0 {
+		if !d.refreshing {
+			d.refreshing = true
+			go d.refreshInBackground()
+		}
+		return nil
+	}
 	entries, err := list.DirSorted(d.vfs.ctx, d.f, false, d.path)
+	return d._applyListing(entries, err, when)
+}
+
+// refreshInBackground re-lists the directory without holding d.mu for the
+// backend round trip, then applies the result under the lock. d.refreshing is
+// set by the caller and cleared here.
+func (d *Dir) refreshInBackground() {
+	when := time.Now()
+	entries, err := list.DirSorted(d.vfs.ctx, d.f, false, d.path)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.refreshing = false
+	if aerr := d._applyListing(entries, err, when); aerr != nil {
+		// Keep serving what we have and ask again shortly, rather than
+		// pinning either the old entries or the failure for DirCacheTime.
+		fs.Errorf(d.path, "Background directory refresh failed; keeping the %d cached entries and retrying in %v: %v", len(d.items), dirNotFoundRetry, aerr)
+		d.read = when.Add(dirNotFoundRetry - time.Duration(d.vfs.Opt.DirCacheTime))
+	}
+}
+
+// _applyListing updates the directory from a listing's result, with d.mu
+// held. when is the time the listing was started.
+func (d *Dir) _applyListing(entries fs.DirEntries, err error, when time.Time) error {
 	notFound := false
 	if err == fs.ErrorDirNotFound {
 		// We treat directory not found as empty because we

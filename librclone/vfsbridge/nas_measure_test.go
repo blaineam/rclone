@@ -137,3 +137,63 @@ func TestMeasureNASRead(t *testing.T) {
 		mib, fs.SizeSuffix(readSize), elapsed.Round(time.Millisecond), float64(total)/elapsed.Seconds()/1e6,
 		len(lat), pct(0.5).Round(time.Millisecond), pct(0.9).Round(time.Millisecond), pct(0.99).Round(time.Millisecond), lat[len(lat)-1].Round(time.Millisecond), profPath)
 }
+
+// TestMeasureNASReaddir times a directory listing through the bridge against
+// the server named by ES_VFSBRIDGE_NAS: cold, then warm, then after the
+// cached listing has gone stale (DirCacheTime forced to a millisecond), which
+// is the case every lookup and readdir hits once a directory is five minutes
+// old. ES_VFSBRIDGE_NAS_DIR names the directory relative to the SFTP root.
+func TestMeasureNASReaddir(t *testing.T) {
+	spec := os.Getenv("ES_VFSBRIDGE_NAS")
+	if spec == "" {
+		t.Skip("set ES_VFSBRIDGE_NAS to run the NAS readdir measurement")
+	}
+	relDir := os.Getenv("ES_VFSBRIDGE_NAS_DIR")
+	if relDir == "" {
+		t.Fatal("set ES_VFSBRIDGE_NAS_DIR to a directory relative to the SFTP root")
+	}
+	tmp := t.TempDir()
+	confPath := filepath.Join(tmp, "rclone.conf")
+	var conf strings.Builder
+	conf.WriteString("[nas]\ntype = sftp\nknown_hosts_file = none\nshell_type = unix\n")
+	for _, kv := range strings.Split(spec, ",") {
+		k, v, _ := strings.Cut(kv, "=")
+		fmt.Fprintf(&conf, "%s = %s\n", strings.TrimSpace(k), strings.TrimSpace(v))
+	}
+	if err := os.WriteFile(confPath, []byte(conf.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.SetConfigPath(confPath)
+	configfile.Install()
+	useTempCacheDir(t)
+	s := NewServer()
+	if err := s.AddRemote("nas"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Stop)
+	dir := remoteRootID(t, s, "nas")
+	for _, p := range strings.Split(relDir, "/") {
+		dir = childID(t, s, dir, p)
+	}
+	timed := func(label string) int {
+		t0 := time.Now()
+		r := mustOK(t, s.handleRequest(req(t, 1, "readdir", map[string]any{"dirId": dir})), "readdir")
+		n := len(r.Result.([]DirEntry))
+		t.Logf("%s: %d entries in %v", label, n, time.Since(t0).Round(time.Millisecond))
+		return n
+	}
+	timed("cold readdir")
+	timed("warm readdir")
+	// Force the cached listing stale, as five minutes would. The cache's
+	// cleanup timer drops an unvisited directory at twice DirCacheTime, so
+	// the stale window is kept wide enough for the refresh to land inside it.
+	s.mu.RLock()
+	v := s.vfses["nas"]
+	s.mu.RUnlock()
+	v.Opt.DirCacheTime = fs.Duration(3 * time.Second)
+	time.Sleep(3500 * time.Millisecond)
+	timed("stale readdir (served from cache, refresh in background)")
+	timed("stale readdir again")
+	time.Sleep(3 * time.Second)
+	timed("after the refresh landed")
+}
