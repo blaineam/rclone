@@ -373,3 +373,85 @@ func TestInPlaceEditOverSFTPCostsOnlyThePatch(t *testing.T) {
 }
 
 var _ = fs.Debugf
+
+// A new file copied onto a streaming remote the way the kernel does it --
+// create, open for writing, sequential writes, close, then renamed over an
+// existing film -- must keep streaming with range writes available, including
+// when a second open for writing arrives mid-copy and when the copier sets the
+// size first. Sami's copy-beside fallback did exactly this and failed EIO on
+// the first build with range writes (2026-10-23).
+func TestStreamingCopyStillStreamsWithRangeWrites(t *testing.T) {
+	s, backingA := streamingServer(t)
+	dir := remoteRootID(t, s, "rem_a")
+	if err := os.WriteFile(filepath.Join(backingA, "film.mp4"), []byte("the old film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	filmID := childID(t, s, dir, "film.mp4")
+
+	part := payloadOf(1<<20, 'p')
+	copyIn := func(t *testing.T, name string, midCopy func(id uint64)) uint64 {
+		t.Helper()
+		r := mustOK(t, s.handleRequest(req(t, 1, "create", map[string]any{"dirId": dir, "name": name, "isDir": false})), "create")
+		id := r.Result.(ItemInfo).ID
+		mustOK(t, s.handleRequest(req(t, 2, "open", map[string]any{"itemId": id, "write": true})), "open")
+		for i := 0; i < 4; i++ {
+			mustOK(t, s.handleRequest(req(t, 3, "write", map[string]any{"itemId": id, "offset": i * len(part), "data": part})), fmt.Sprintf("write %d", i))
+			if i == 1 && midCopy != nil {
+				midCopy(id)
+			}
+		}
+		mustOK(t, s.handleRequest(req(t, 4, "close", map[string]any{"itemId": id})), "close")
+		got, err := os.ReadFile(filepath.Join(backingA, name))
+		if err != nil || len(got) != 4<<20 || !bytes.Equal(got, bytes.Repeat(part, 4)) {
+			t.Fatalf("%s on the remote: %d bytes, err %v", name, len(got), err)
+		}
+		return id
+	}
+
+	t.Run("plain", func(t *testing.T) {
+		id := copyIn(t, ".film.mp4.sami-tags", nil)
+		mustOK(t, s.handleRequest(req(t, 5, "rename", map[string]any{
+			"srcDirId": dir, "srcName": ".film.mp4.sami-tags", "srcItemId": id,
+			"dstDirId": dir, "dstName": "film.mp4", "dstItemId": filmID})), "rename over the film")
+		got, _ := os.ReadFile(filepath.Join(backingA, "film.mp4"))
+		if len(got) != 4<<20 {
+			t.Fatalf("after the rename the film is %d bytes", len(got))
+		}
+		if _, err := os.Stat(filepath.Join(backingA, ".film.mp4.sami-tags")); !os.IsNotExist(err) {
+			t.Fatalf("the sibling is still there: %v", err)
+		}
+	})
+
+	t.Run("second open for writing mid-copy", func(t *testing.T) {
+		copyIn(t, "second-open.bin", func(id uint64) {
+			// The kernel opens a file being copied a second time; whatever it
+			// gets must not take over the copy's writes. A write through the
+			// second handle fails as it always did (EPERM); the copy's own
+			// writes keep streaming.
+			mustOK(t, s.handleRequest(req(t, 6, "open", map[string]any{"itemId": id, "write": true})), "second open")
+			mustOK(t, s.handleRequest(req(t, 7, "close", map[string]any{"itemId": id})), "second close")
+		})
+	})
+
+	t.Run("size set before the data arrives", func(t *testing.T) {
+		// copyfile may preallocate: a truncate to the final size right after
+		// the create, before any write. An empty file has nothing for a range
+		// write to preserve, so this is refused exactly as before (EPERM) and
+		// the copy that follows streams; the data must land and the size be right.
+		r := mustOK(t, s.handleRequest(req(t, 1, "create", map[string]any{"dirId": dir, "name": "prealloc.bin", "isDir": false})), "create")
+		id := r.Result.(ItemInfo).ID
+		resp := s.handleRequest(req(t, 8, "setattr", map[string]any{"itemId": id, "size": 4 << 20}))
+		if resp.Ok || resp.Error != cEPERM {
+			t.Fatalf("preallocating an empty file on a streaming remote: ok=%v errno=%d, want EPERM as before", resp.Ok, resp.Error)
+		}
+		mustOK(t, s.handleRequest(req(t, 2, "open", map[string]any{"itemId": id, "write": true})), "open")
+		for i := 0; i < 4; i++ {
+			mustOK(t, s.handleRequest(req(t, 3, "write", map[string]any{"itemId": id, "offset": i * len(part), "data": part})), fmt.Sprintf("write %d", i))
+		}
+		mustOK(t, s.handleRequest(req(t, 4, "close", map[string]any{"itemId": id})), "close")
+		got, err := os.ReadFile(filepath.Join(backingA, "prealloc.bin"))
+		if err != nil || !bytes.Equal(got, bytes.Repeat(part, 4)) {
+			t.Fatalf("preallocated copy on the remote: %d bytes, err %v (setattr ok=%v errno=%d)", len(got), err, resp.Ok, resp.Error)
+		}
+	})
+}

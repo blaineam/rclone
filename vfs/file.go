@@ -905,10 +905,20 @@ func (f *File) Open(flags int) (fd Handle, err error) {
 	CacheMode := d.vfs.Opt.CacheMode
 	if CacheMode >= vfscommon.CacheModeMinimal && (d.vfs.cache.InUse(f.CachePath()) || d.vfs.cache.Exists(f.CachePath())) {
 		fd, err = f.openRW(flags)
-	} else if write && rangeOpenWanted(&d.vfs.Opt, flags, f.exists()) {
+	} else if write && rangeOpenWanted(&d.vfs.Opt, flags, f.hasContent()) && !f.hasStreamingWriter() {
 		// An in-place edit with no cache: write at offsets on the backend
 		// itself, where it can (see RangeFileHandle), and EPERM where it
 		// cannot rather than a WriteFileHandle that fails at its first write.
+		//
+		// Only for a file that HAS content, and never while a streaming
+		// upload of it is in flight. A file being copied in exists on the
+		// backend first as the empty object its creation put there; a second
+		// open for writing mid-copy (the kernel does this) or a truncate to
+		// the final size before the data (copiers preallocate) would
+		// otherwise switch the copy from the stream to positioned writes into
+		// the very path the stream is replacing. Those keep the handles they
+		// always got; there are no bytes in an empty file for a range write
+		// to preserve.
 		fd, err = f.openRange()
 	} else if read && write {
 		if CacheMode >= vfscommon.CacheModeMinimal {

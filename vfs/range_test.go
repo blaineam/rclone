@@ -240,3 +240,56 @@ func typeName(v any) string {
 	}
 	return "?"
 }
+
+// An existing file that is still empty is what every file being copied in
+// looks like between its creation and its first write; it keeps streaming,
+// and a truncate of it to a size is refused as before.
+func TestRangeFileHandleEmptyFileStreams(t *testing.T) {
+	_, vfs, _ := rangeFileCreate(t)
+	fd, err := vfs.OpenFile("dir/empty.bin", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
+	require.NoError(t, err)
+	require.NoError(t, fd.Close())
+
+	fd, err = vfs.OpenFile("dir/empty.bin", os.O_WRONLY, 0o666)
+	require.NoError(t, err)
+	assert.Equal(t, "*vfs.WriteFileHandle", typeName(fd), "an empty file has nothing for a range write to preserve")
+	require.NoError(t, fd.Close())
+
+	node, err := vfs.Stat("dir/empty.bin")
+	require.NoError(t, err)
+	assert.Equal(t, EPERM, node.Truncate(4<<20), "preallocating an empty file is refused as it always was in cache mode off")
+}
+
+// A second open for writing while a streaming upload of the file is in
+// flight must not become a range handle: the file exists on the backend only
+// as the empty object its creation put there, and the rest of the copy's
+// writes would otherwise go to positioned writes into the path the stream is
+// replacing. It gets the handle it always got.
+func TestRangeFileHandleNotWhileStreaming(t *testing.T) {
+	_, vfs, _ := rangeFileCreate(t)
+
+	// A new file, as a create-then-open does it: the create leaves an empty
+	// object behind, the open streams.
+	fd, err := vfs.OpenFile("dir/copy.bin", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
+	require.NoError(t, err)
+	require.NoError(t, fd.Close())
+	stream, err := vfs.OpenFile("dir/copy.bin", os.O_WRONLY|os.O_TRUNC, 0o666)
+	require.NoError(t, err)
+	assert.Equal(t, "*vfs.WriteFileHandle", typeName(stream))
+	_, err = stream.Write([]byte("first part "))
+	require.NoError(t, err)
+
+	// The second open, mid-stream, without O_TRUNC.
+	second, err := vfs.OpenFile("dir/copy.bin", os.O_WRONLY, 0o666)
+	require.NoError(t, err)
+	assert.Equal(t, "*vfs.WriteFileHandle", typeName(second), "a range handle over an in-flight stream")
+	require.NoError(t, second.Close())
+
+	_, err = stream.Write([]byte("second part"))
+	require.NoError(t, err)
+	require.NoError(t, stream.Close())
+
+	node, err := vfs.Stat("dir/copy.bin")
+	require.NoError(t, err)
+	assert.Equal(t, int64(len("first part second part")), node.Size())
+}

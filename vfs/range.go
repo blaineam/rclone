@@ -318,15 +318,33 @@ func (fh *RangeFileHandle) Release() error {
 	return err
 }
 
+// hasContent reports whether f exists on the backend with at least one byte.
+func (f *File) hasContent() bool {
+	return f.exists() && f.Size() > 0
+}
+
+// hasStreamingWriter reports whether a WriteFileHandle (a sequential upload
+// of the whole file) is open on f right now.
+func (f *File) hasStreamingWriter() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for _, w := range f.writers {
+		if _, ok := w.(*WriteFileHandle); ok {
+			return true
+		}
+	}
+	return false
+}
+
 // rangeOpenWanted reports whether an open with these flags of a file in a
 // VFS with these options is an in-place edit to serve with a
 // RangeFileHandle: cache mode off with range writes on, a write that does
-// not truncate, of a file that exists.
-func rangeOpenWanted(opt *vfscommon.Options, flags int, exists bool) bool {
+// not truncate, of a file that has content.
+func rangeOpenWanted(opt *vfscommon.Options, flags int, hasContent bool) bool {
 	if opt.CacheMode != vfscommon.CacheModeOff || !opt.RangeWrites {
 		return false
 	}
-	if flags&os.O_TRUNC != 0 || !exists {
+	if flags&os.O_TRUNC != 0 || !hasContent {
 		return false
 	}
 	switch flags & accessModeMask {

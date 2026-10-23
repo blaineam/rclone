@@ -244,7 +244,11 @@ sets its size, and `fsync` returns once the backend has the bytes on
 stable storage where it can promise that (SFTP servers with the
 `fsync@openssh.com` extension). Patching a few bytes of metadata into a
 multi-GB file costs those bytes, not the file. Reads of a file open this
-way go to the backend and see the bytes written so far.
+way go to the backend and see the bytes written so far. Only a file that
+already has content is edited this way: a file that is still empty (one
+being copied in, between its creation and its first write) streams as
+before, and a second open for writing while that stream is in flight gets
+the handle it always got.
 
 Backends that cannot write at an offset (object stores, and the `crypt`,
 `compress` and `chunker` wrappers, where a byte patch would break the
