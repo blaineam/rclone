@@ -129,6 +129,38 @@ func TestDownloaders(t *testing.T) {
 		}, 10*time.Second, 10*time.Millisecond)
 	})
 
+	// Enter Space fork: a per-item override of --vfs-read-ahead decides how
+	// far a new downloader runs past the requested range, and clearing it
+	// hands control back to the option.
+	t.Run("SetReadAhead", func(t *testing.T) {
+		_, dls := newTest()
+		defer cancel(dls)
+		dls.opt.ReadAhead = 10 * 1024 * 1024
+		maxOffsetAt := func(pos int64) int64 {
+			dls.mu.Lock()
+			defer dls.mu.Unlock()
+			for _, dl := range dls.dls {
+				dl.mu.Lock()
+				start, maxOffset := dl.start, dl.maxOffset
+				dl.mu.Unlock()
+				if start == pos {
+					return maxOffset
+				}
+			}
+			return -1
+		}
+
+		dls.SetReadAhead(1000)
+		r := ranges.Range{Pos: 1000, Size: 250}
+		require.NoError(t, dls.Download(r))
+		assert.Equal(t, r.End()+1000, maxOffsetAt(r.Pos), "override applies to a new downloader")
+
+		dls.SetReadAhead(-1)
+		r2 := ranges.Range{Pos: 30 * 1024 * 1024, Size: 250}
+		require.NoError(t, dls.Download(r2))
+		assert.Equal(t, r2.End()+10*1024*1024, maxOffsetAt(r2.Pos), "clearing the override restores the option")
+	})
+
 	// A waiter for a range beyond the item's size but within the source
 	// object's size must still be dispatched. _ensureDownloader will not
 	// start a downloader for it, so nothing else would ever wake it.

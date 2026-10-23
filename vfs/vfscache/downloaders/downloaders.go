@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -29,8 +30,15 @@ const (
 	// maximum number of errors before declaring dead
 	maxErrorCount = 10
 	// If a downloader is within this range or --buffer-size
-	// whichever is the larger, we will reuse the downloader
-	minWindow = 1024 * 1024
+	// whichever is the larger, we will reuse the downloader.
+	//
+	// Enter Space fork: 16MiB, upstream's default --buffer-size, rather than
+	// upstream's 1MiB. The bridge runs its cached remotes with a 2MiB buffer
+	// so a probe of a file's header does not pull 16MiB into memory, and
+	// the reuse distance must not shrink with it: a read landing a few MiB
+	// ahead of a running downloader should wait for it, not open a second
+	// stream to the backend.
+	minWindow = 16 * 1024 * 1024
 )
 
 // Item is the interface that an item to download must obey
@@ -65,6 +73,9 @@ type Downloaders struct {
 	src    fs.Object // source object
 	remote string
 	wg     sync.WaitGroup
+	// readAhead overrides opt.ReadAhead when >= 0. Set per read by callers that
+	// know their access pattern (see Item.SetReadAhead); -1 means use the option.
+	readAhead atomic.Int64
 
 	// Read write
 	mu         sync.Mutex
@@ -115,6 +126,7 @@ func New(ctx context.Context, item Item, opt *vfscommon.Options, remote string, 
 		src:    src,
 		remote: remote,
 	}
+	dls.readAhead.Store(-1)
 	dls.wg.Go(func() {
 		ticker := time.NewTicker(backgroundKickerInterval)
 		defer ticker.Stop()
@@ -288,9 +300,18 @@ func (dls *Downloaders) _ensureDownloader(r ranges.Range) (err error) {
 	// The window includes potentially unread data in the buffer
 	window := int64(fs.GetConfig(dls.ctx).BufferSize)
 
-	// Increase the read range by the read ahead if set
-	if dls.opt.ReadAhead > 0 {
-		r.Size += int64(dls.opt.ReadAhead)
+	// Increase the read range by the read ahead if set.
+	//
+	// Enter Space fork: a per-item override (SetReadAhead) takes precedence
+	// over the global --vfs-read-ahead, so a caller can keep read-ahead small
+	// for a probe of a file's header and grow it once reads turn out to be
+	// sequential. Upstream only has the global option.
+	readAhead := int64(dls.opt.ReadAhead)
+	if n := dls.readAhead.Load(); n >= 0 {
+		readAhead = n
+	}
+	if readAhead > 0 {
+		r.Size += readAhead
 	}
 
 	// We may be reopening a downloader after a failure here or
@@ -368,6 +389,16 @@ func (dls *Downloaders) _ensureDownloader(r ranges.Range) (err error) {
 		return fmt.Errorf("failed to start downloader: %w", err)
 	}
 	return err
+}
+
+// SetReadAhead overrides the --vfs-read-ahead option for this file's
+// downloaders: every range asked for from now on is extended by n bytes
+// instead of by the option. A negative n restores the option. Safe to call
+// concurrently with downloads; it applies from the next range request.
+//
+// Enter Space fork addition, see _ensureDownloader.
+func (dls *Downloaders) SetReadAhead(n int64) {
+	dls.readAhead.Store(n)
 }
 
 // EnsureDownloader makes sure a downloader is running for the range

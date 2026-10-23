@@ -136,25 +136,36 @@ func (s *Server) AddRemote(remoteName string) (retErr error) {
 	opt.DirCacheTime = fs.Duration(5 * time.Minute)
 	opt.PollInterval = fs.Duration(1 * time.Minute)
 
-	// How far the cache downloader runs AHEAD of the reader. This was 128KiB,
-	// which is barely ahead at all: with CacheModeFull every read then waits on
-	// its own backend round trip instead of landing in already-fetched cache.
+	// How far the cache downloader runs AHEAD of each read. Decided PER READ
+	// from the handle's access pattern (readahead.go); this option is only the
+	// floor, used for the first read on a handle, after a seek, and by any
+	// path that carries no hint.
 	//
-	// Measured cold on a crypt-wrapped remote, 40MB file: 60 reads of about
-	// 680KB averaging 409ms EACH = 2.0 MB/s. With 128MiB of read-ahead the same
-	// workload runs at 10.0 MB/s -- 5x, from this one line.
+	// History, because the numbers matter. This was 128KiB, which is barely
+	// ahead at all: with CacheModeFull every read then waited on its own
+	// backend round trip, and a cold sequential read of a 40MB file on a
+	// crypt-wrapped remote ran at 2.0 MB/s (60 reads of ~680KB, 409ms each).
+	// A fixed 128MiB took the same workload to 10.0 MB/s, and that gain is
+	// kept: a sequential run grows its window to 128MiB within a few MiB.
 	//
-	// 128MiB matches rclone's own vfs_read_chunk_size default, so the
-	// downloader can stay a whole chunk ahead. It costs disk in the VFS cache,
-	// not RAM, because CacheModeFull writes ahead into the cache file.
+	// But fixed at 128MiB, EVERY read fetched 128MiB, including a probe of a
+	// file's header. Sami opens hundreds of films on this volume and reads a
+	// few KiB from each, so each probe started a 128MiB download, hundreds
+	// of them at once, and the reads queued behind them tripped
+	// BridgeClient's 10s timeout. Measured cold on a 300MiB file over a
+	// loopback `rclone serve webdav` (readahead_measure_test.go):
 	//
-	// For scale: the File Provider reads the same remote cold at 3.5 MB/s, so
-	// 10 MB/s is roughly 3x the other path in this app rather than something
-	// still lagging it. An earlier 114 MB/s figure for the File Provider was a
-	// measurement error -- that file had already been materialised locally, so
-	// it timed a disk read against a network fetch. Verify `stat -f %b` is 0
-	// before trusting any "cold" number from that path.
-	opt.ReadAhead = 128 * fs.Mebi
+	//	                  64KiB probe fetched   sequential 300MiB
+	//	fixed 128MiB      151 MiB               989 MB/s
+	//	adaptive          5.5 MiB               1020 MB/s
+	//
+	// The 5.5MiB is 2MiB of read-ahead plus the 2MiB async buffer
+	// (cachedBufferSize) and socket buffers; with rclone's default 16MiB
+	// buffer the same probe pulled 19.5MiB even when the read-ahead was
+	// honoured, which is why that buffer is set on the VFS context below.
+	// It costs disk in the VFS cache, not RAM, because CacheModeFull writes
+	// ahead into the cache file.
+	opt.ReadAhead = readAheadMin
 
 	// Left at rclone's default of 0 (single stream) DELIBERATELY.
 	//
@@ -165,7 +176,15 @@ func (s *Server) AddRemote(remoteName string) (retErr error) {
 	opt.ChunkStreams = 0
 
 	mode := RemoteMode{Mode: "cached"}
-	vfsCtx := context.Background()
+	// The settings below ride on the context, for THIS volume only.
+	vfsCtx, ci := fs.AddConfig(context.Background())
+	// How much the cache downloader buffers in memory beyond what it has
+	// written to the cache file. rclone's 16MiB default was the larger part
+	// of what a probe fetched: the downloader stops at its read-ahead, but the
+	// reader feeding it keeps pulling from the backend until this buffer is
+	// full. Measured on a loopback remote, a 64KiB read at the start of a
+	// 300MiB file pulled 19.5MiB with the default and about 5MiB with this.
+	ci.BufferSize = cachedBufferSize
 	if s.writeThrough[remoteName] {
 		// Stream writes straight to the remote, so the writer is held to the upload's pace
 		// and close(2) means the bytes are there. Needs a backend that can take an upload
@@ -176,9 +195,7 @@ func (s *Server) AddRemote(remoteName string) (retErr error) {
 			mode = RemoteMode{Mode: "through"}
 			// rclone reads the stream through an async buffer (16MiB by default), which would
 			// let the writer run that far ahead of the upload and leave close waiting out the
-			// tail. Keep it small for THIS volume only: the setting rides on the context.
-			var ci *fs.ConfigInfo
-			vfsCtx, ci = fs.AddConfig(vfsCtx)
+			// tail. Keep it small.
 			ci.BufferSize = throughBufferSize
 		} else {
 			mode.Note = "This remote can't stream uploads, so writes stay buffered."
@@ -1351,8 +1368,8 @@ func (s *Server) doRead(req *Request) *Response {
 	if err := json.Unmarshal(req.Args, &args); err != nil {
 		return errorResp(req.ID, cEINVAL)
 	}
-	handle := s.handles.GetForRead(args.ItemID)
-	if handle == nil {
+	entry := s.handles.getForRead(args.ItemID)
+	if entry == nil {
 		// A read with no registered open handle is LEGAL, and answering ENOENT
 		// for it corrupts files.
 		//
@@ -1385,8 +1402,18 @@ func (s *Server) doRead(req *Request) *Response {
 			fs.Errorf(nil, "VFS bridge: lazy read-open of item %d failed: %v", args.ItemID, err)
 			return errorResp(req.ID, mapVFSErr(err))
 		}
-		s.handles.PutLazy(args.ItemID, h)
-		handle = h
+		entry = s.handles.PutLazy(args.ItemID, h)
+	}
+	handle := entry.h
+	// Size the read-ahead from this handle's access pattern BEFORE the read:
+	// the cache downloader decides how far to run when the read asks for its
+	// range. See readahead.go for the policy and why one fixed value failed.
+	if setter, ok := handle.(readAheadSetter); ok {
+		ra := entry.ra.next(args.Offset, args.Length)
+		if !readAheadAdaptive {
+			ra = int64(readAheadMax)
+		}
+		setter.SetReadAhead(ra)
 	}
 	buf := make([]byte, args.Length)
 	n, err := handle.ReadAt(buf, args.Offset)

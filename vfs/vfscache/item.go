@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -71,6 +72,7 @@ type Item struct {
 	beingReset      bool                     // cache cleaner is resetting the cache file, access not allowed
 	graceTimer      *time.Timer              // timer for delayed close after grace period
 	closing         chan struct{}            // non-nil while a grace-period close is tearing the handle down, closed when done
+	readAhead       atomic.Int64             // per-item read-ahead override, -1 = use the option (SetReadAhead)
 }
 
 // Info is persisted to backing store
@@ -142,6 +144,7 @@ func newItem(c *Cache, name string) (item *Item) {
 			ATime:   now,
 		},
 	}
+	item.readAhead.Store(-1)
 	item.cond = sync.Cond{L: &item.mu}
 	// check the cache file exists
 	osPath := c.toOSPath(name)
@@ -620,7 +623,7 @@ func (item *Item) open(o fs.Object) (err error) {
 
 	// Create the downloaders
 	if item.o != nil {
-		item.downloaders = downloaders.New(item.c.ctx, item, item.c.opt, item.name, item.o)
+		item.downloaders = item._newDownloaders()
 	}
 
 	return err
@@ -1167,7 +1170,7 @@ func (item *Item) Reset() (rr ResetResult, spaceFreed int64, err error) {
 
 	// Create the downloaders
 	if item.o != nil {
-		item.downloaders = downloaders.New(item.c.ctx, item, item.c.opt, item.name, item.o)
+		item.downloaders = item._newDownloaders()
 	}
 
 	/* The item will stay in the beingReset state if we get an error that prevents us from
@@ -1294,9 +1297,40 @@ func (item *Item) _ensure(offset, size int64) (err error) {
 			}
 			item.o = o
 		}
-		item.downloaders = downloaders.New(item.c.ctx, item, item.c.opt, item.name, item.o)
+		item.downloaders = item._newDownloaders()
 	}
 	return item.downloaders.Download(r)
+}
+
+// _newDownloaders creates the downloaders for this item, carrying over the
+// read-ahead override. Open creates them before the first read, so applying
+// the override only on creation in _ensure left a hint set before the first
+// read ignored.
+func (item *Item) _newDownloaders() *downloaders.Downloaders {
+	dls := downloaders.New(item.c.ctx, item, item.c.opt, item.name, item.o)
+	if n := item.readAhead.Load(); n >= 0 {
+		dls.SetReadAhead(n)
+	}
+	return dls
+}
+
+// SetReadAhead sets how far past each requested range this item's
+// downloaders fetch, overriding --vfs-read-ahead for this file only. It
+// applies to the next read, and survives the downloaders being recreated.
+// A negative n restores the option.
+//
+// Enter Space fork addition: the FSKit bridge sets this per read from the
+// access pattern it sees on each handle (small for a probe of a file's
+// header, large once reads are sequential), which the global option cannot
+// express.
+func (item *Item) SetReadAhead(n int64) {
+	item.readAhead.Store(n)
+	item.mu.Lock()
+	dls := item.downloaders
+	item.mu.Unlock()
+	if dls != nil {
+		dls.SetReadAhead(n)
+	}
 }
 
 // _written marks the (offset, size) as present in the backing file

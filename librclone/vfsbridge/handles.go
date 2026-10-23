@@ -14,6 +14,8 @@ type handleEntry struct {
 	// arrived with no handle open (see doRead). Nothing on the FSKit side
 	// refers to it, so the bridge may close it whenever that helps.
 	lazy bool
+	// ra tracks this handle's read pattern to size its read-ahead (readahead.go).
+	ra readAhead
 }
 
 // HandleTable manages open file handles, keyed by item ID.
@@ -40,28 +42,32 @@ type handleEntry struct {
 // happened to be stored last.
 type HandleTable struct {
 	mu      sync.RWMutex
-	handles map[uint64][]handleEntry
+	handles map[uint64][]*handleEntry
 }
 
 // NewHandleTable creates a new handle table.
 func NewHandleTable() *HandleTable {
 	return &HandleTable{
-		handles: make(map[uint64][]handleEntry),
+		handles: make(map[uint64][]*handleEntry),
 	}
 }
 
 // Put records a newly opened handle for the given item ID.
-func (t *HandleTable) Put(itemID uint64, handle vfs.Handle, write bool) {
+func (t *HandleTable) Put(itemID uint64, handle vfs.Handle, write bool) *handleEntry {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.handles[itemID] = append(t.handles[itemID], handleEntry{h: handle, write: write})
+	e := &handleEntry{h: handle, write: write}
+	t.handles[itemID] = append(t.handles[itemID], e)
+	return e
 }
 
 // PutLazy records a read handle the bridge opened on its own behalf.
-func (t *HandleTable) PutLazy(itemID uint64, handle vfs.Handle) {
+func (t *HandleTable) PutLazy(itemID uint64, handle vfs.Handle) *handleEntry {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.handles[itemID] = append(t.handles[itemID], handleEntry{h: handle, lazy: true})
+	e := &handleEntry{h: handle, lazy: true}
+	t.handles[itemID] = append(t.handles[itemID], e)
+	return e
 }
 
 // PopLazy removes and returns the lazily opened read handles of an item,
@@ -107,13 +113,21 @@ func (t *HandleTable) GetForWrite(itemID uint64) vfs.Handle {
 
 // GetForRead returns any handle able to service a read.
 func (t *HandleTable) GetForRead(itemID uint64) vfs.Handle {
+	if e := t.getForRead(itemID); e != nil {
+		return e.h
+	}
+	return nil
+}
+
+// getForRead returns the entry GetForRead would pick, with its read-ahead state.
+func (t *HandleTable) getForRead(itemID uint64) *handleEntry {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	entries := t.handles[itemID]
 	if len(entries) == 0 {
 		return nil
 	}
-	return entries[len(entries)-1].h
+	return entries[len(entries)-1]
 }
 
 // PopLast removes and returns the most recently opened handle for an item,

@@ -30,6 +30,17 @@ type RWFileHandle struct {
 	writeCalled bool // if any Write() methods have been called
 }
 
+// SetReadAhead sets how far past each read the cache downloader fetches for
+// this handle's file, overriding --vfs-read-ahead for that file. A negative n
+// restores the option. The setting belongs to the cached file, so it is shared
+// by every handle open on it; a caller that sets it before each read gets the
+// pattern it asked for.
+//
+// Enter Space fork addition, used by librclone/vfsbridge.
+func (fh *RWFileHandle) SetReadAhead(n int64) {
+	fh.item.SetReadAhead(n)
+}
+
 // Lock performs Unix locking, not supported
 func (fh *RWFileHandle) Lock() error {
 	return os.ErrInvalid
