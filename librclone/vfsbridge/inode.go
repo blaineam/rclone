@@ -155,12 +155,55 @@ func (t *InodeTable) UnbindSubtree(remote string) []uint64 {
 	return unbound
 }
 
+// Rename moves the inode at oldPath, and everything cached below it, to
+// newPath, and unbinds whatever was at newPath and below it.
+//
+// Identity on rename used to come out wrong in a way that only showed with
+// time. Ids are keyed by path, so after `mv incoming target` a lookup of
+// target hit the path's existing entry and handed the renamed node the
+// OVERWRITTEN item's id. The FSKit side then addressed the renamed file by
+// that id -- and when FSKit reclaimed the overwritten item, as it does some
+// time after any rename over it, Remove dropped the id and every operation
+// on the renamed file failed ENOENT: `mv` onto a file that had itself been
+// renamed onto, a Cocoa safe-save's backup, Sami's tag write. Whether it
+// failed depended on when the reclaim landed, so the harness passed on luck.
+//
+// Now the renamed node keeps its own id under its new path, as POSIX wants,
+// and the overwritten item's id answers ENOENT until its reclaim. Its path
+// entries stay until then, which is why Remove checks it still owns a path
+// before deleting the path's mapping.
+func (t *InodeTable) Rename(oldPath, newPath string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	newPrefix := newPath + "/"
+	for id, p := range t.idToPath {
+		if p == newPath || strings.HasPrefix(p, newPrefix) {
+			delete(t.idToNode, id)
+		}
+	}
+	oldPrefix := oldPath + "/"
+	for id, p := range t.idToPath {
+		if p == oldPath || strings.HasPrefix(p, oldPrefix) {
+			if _, bound := t.idToNode[id]; !bound {
+				continue
+			}
+			moved := newPath + p[len(oldPath):]
+			t.idToPath[id] = moved
+			t.pathToID[moved] = id
+			if t.pathToID[p] == id {
+				delete(t.pathToID, p)
+			}
+		}
+	}
+}
+
 // Remove removes an inode from the table.
 func (t *InodeTable) Remove(id uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if path, ok := t.idToPath[id]; ok {
+	if path, ok := t.idToPath[id]; ok && t.pathToID[path] == id {
 		delete(t.pathToID, path)
 	}
 	delete(t.idToNode, id)

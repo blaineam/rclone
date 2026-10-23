@@ -1215,9 +1215,18 @@ func (s *Server) doRename(req *Request) *Response {
 		// honestly so the caller falls back rather than losing the file.
 		return errorResp(req.ID, cEXDEV)
 	}
-	if err := srcDir.Rename(args.SrcName, storedName(dstDir, args.DstName), dstDir); err != nil {
+	// The source's stored spelling, for the inode table's path key; the VFS
+	// matches the caller's name normalization-insensitively.
+	srcName := args.SrcName
+	if node, err := srcDir.Stat(args.SrcName); err == nil {
+		srcName = node.Name()
+	}
+	dstName := storedName(dstDir, args.DstName)
+	if err := srcDir.Rename(args.SrcName, dstName, dstDir); err != nil {
 		return errorResp(req.ID, mapVFSErr(err))
 	}
+	// Keep the renamed item's identity: see InodeTable.Rename.
+	s.inodes.Rename(s.inodes.GetPath(args.SrcDirID)+"/"+srcName, s.inodes.GetPath(args.DstDirID)+"/"+dstName)
 	return okResp(req.ID, nil)
 }
 
