@@ -197,3 +197,100 @@ func TestMeasureNASReaddir(t *testing.T) {
 	time.Sleep(3 * time.Second)
 	timed("after the refresh landed")
 }
+
+// TestMeasureNASWrite times writing a file through the bridge to the server
+// named by ES_VFSBRIDGE_NAS, in streaming (write-through) mode and in cached
+// mode: the 1 MiB writes, the close, and for cached mode the upload that
+// follows. ES_VFSBRIDGE_NAS_WRITE_DIR names the directory to write into,
+// relative to the SFTP root; the file is removed afterwards.
+func TestMeasureNASWrite(t *testing.T) {
+	spec := os.Getenv("ES_VFSBRIDGE_NAS")
+	if spec == "" {
+		t.Skip("set ES_VFSBRIDGE_NAS to run the NAS write measurement")
+	}
+	relDir := os.Getenv("ES_VFSBRIDGE_NAS_WRITE_DIR")
+	if relDir == "" {
+		t.Fatal("set ES_VFSBRIDGE_NAS_WRITE_DIR to a directory relative to the SFTP root")
+	}
+	mib := int64(64)
+	if v := os.Getenv("ES_VFSBRIDGE_NAS_MIB"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mib = n
+	}
+	tmp := t.TempDir()
+	confPath := filepath.Join(tmp, "rclone.conf")
+	var conf strings.Builder
+	conf.WriteString("[nas]\ntype = sftp\nknown_hosts_file = none\nshell_type = unix\n")
+	for _, kv := range strings.Split(spec, ",") {
+		k, v, _ := strings.Cut(kv, "=")
+		fmt.Fprintf(&conf, "%s = %s\n", strings.TrimSpace(k), strings.TrimSpace(v))
+	}
+	for _, extra := range strings.Split(os.Getenv("ES_VFSBRIDGE_NAS_EXTRA"), ";") {
+		if extra = strings.TrimSpace(extra); extra != "" {
+			conf.WriteString(extra + "\n")
+		}
+	}
+	if err := os.WriteFile(confPath, []byte(conf.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.SetConfigPath(confPath)
+	configfile.Install()
+	useTempCacheDir(t)
+	buf := make([]byte, fs.Mebi)
+	for i := range buf {
+		buf[i] = byte(i * 13)
+	}
+	for _, mode := range []struct {
+		name    string
+		through bool
+	}{{"streaming", true}, {"cached", false}} {
+		t.Run(mode.name, func(t *testing.T) {
+			s := NewServer()
+			s.SetWriteThrough("nas", mode.through)
+			if err := s.AddRemote("nas"); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(s.Stop)
+			dir := remoteRootID(t, s, "nas")
+			for _, p := range strings.Split(relDir, "/") {
+				dir = childID(t, s, dir, p)
+			}
+			name := fmt.Sprintf("es-write-probe-%s.bin", mode.name)
+			r := mustOK(t, s.handleRequest(req(t, 1, "create", map[string]any{"dirId": dir, "name": name, "isDir": false})), "create")
+			id := r.Result.(ItemInfo).ID
+			mustOK(t, s.handleRequest(req(t, 2, "open", map[string]any{"itemId": id, "write": true})), "open")
+			t0 := time.Now()
+			for i := int64(0); i < mib; i++ {
+				mustOK(t, s.handleRequest(req(t, 3, "write", map[string]any{"itemId": id, "offset": i * int64(fs.Mebi), "data": buf})), "write")
+			}
+			writes := time.Since(t0)
+			t0 = time.Now()
+			mustOK(t, s.handleRequest(req(t, 4, "close", map[string]any{"itemId": id})), "close")
+			closeTook := time.Since(t0)
+			// Cached mode uploads after the close; wait for the queue to drain.
+			t0 = time.Now()
+			deadline := time.Now().Add(10 * time.Minute)
+			for {
+				s.mu.RLock()
+				v := s.vfses["nas"]
+				s.mu.RUnlock()
+				if b, _ := v.QueuedUploadBytes(); b == 0 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("upload never drained")
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+			drained := time.Since(t0)
+			total := float64(mib*int64(fs.Mebi)) / 1e6
+			t.Logf("%s: %d MiB in %d writes: writes %v (%.1f MB/s), close %v, upload drained %v after close; end to end %.1f MB/s",
+				mode.name, mib, mib, writes.Round(time.Millisecond), total/writes.Seconds(), closeTook.Round(time.Millisecond),
+				drained.Round(time.Millisecond), total/(writes+closeTook+drained).Seconds())
+			mustOK(t, s.handleRequest(req(t, 5, "remove", map[string]any{"dirId": dir, "itemId": id, "name": name})), "remove")
+		})
+	}
+}
