@@ -10,45 +10,47 @@ import (
 //
 // With CacheModeFull every read is served from the VFS cache, and the cache
 // downloader fetches ReadAhead bytes PAST each read before it stops. One fixed
-// value cannot suit both workloads this volume sees:
+// value cannot suit every workload this volume sees:
 //
 //   - Streaming. A sequential read of a crypt-wrapped remote ran at 2.0 MB/s
 //     with 128KiB of read-ahead and 10.0 MB/s with 128MiB (see docs/FSKIT.md
-//     §15): every read must land in cache that is already fetched, or it
-//     waits on its own backend round trip.
+//     §15): on a high-latency backend the downloader stalls at the end of
+//     its window and every restart costs a round trip, so the window has to
+//     be large to keep the stream moving.
 //   - Probing. Sami opens hundreds of films on the volume and reads a few
 //     KiB of header from each. With 128MiB of read-ahead every one of those
 //     probes started a 128MiB download, hundreds of them at once, and the
 //     reads behind them waited past BridgeClient's 10s timeout.
+//   - Parsing. AVFoundation reads a film's metadata as a few hundred small
+//     reads walking through the first 15 MiB or so. Grown by read count that
+//     looked like a stream, and the window hit the ceiling before the parse
+//     was a megabyte in: every film loaded cost 128MiB of download for
+//     15MiB of use, which over a 10 MB/s link is the hour it took Sami to
+//     load 227 of them (docs/FSKIT.md §25).
+//   - Seeking in bulk. An export reads a whole film with its audio and video
+//     cursors leapfrogging. Each cursor's reads look like seeks to the other,
+//     yet the handle reads everything.
 //
-// So the read-ahead is decided per read, from what the handle has done so
-// far: a fresh handle, or one that just seeked, gets readAheadMin; each run
-// of readAheadStep sequential reads multiplies it by four, up to
-// readAheadMax. A probe costs the probe plus readAheadMin; a stream reaches
-// the full window within its first few MiB.
-//
-// Sequential means the read starts within readAheadNear of where the
-// previous one ended, in either direction. The kernel issues a stream's
-// reads slightly out of order and sometimes re-reads a page, and neither is
-// a seek.
+// So the read-ahead is sized by what the handle has consumed, not by how
+// its reads were shaped: half the bytes read through it so far, between
+// readAheadMin and readAheadMax. A probe costs the probe plus readAheadMin.
+// A parse that reads 15 MiB has fetched at most 7.5 MiB past what it used.
+// A stream's window doubles with every doubling of what it has read and
+// reaches the ceiling by 256 MiB. A reader that seeks keeps the window its
+// consumption has earned, because the window never depended on the seek.
 const (
-	// Read-ahead for the first read on a handle and after a seek.
+	// Read-ahead floor: the first read on a handle gets this much.
 	readAheadMin = 2 * fs.Mebi
-	// Ceiling, reached after 3 growth steps: 2 → 8 → 32 → 128 MiB.
+	// Ceiling, reached once the handle has read twice this much.
 	readAheadMax = 128 * fs.Mebi
-	// Sequential reads per growth step.
-	readAheadStep = 4
-	// A read starting within this distance of the previous read's end, in
-	// either direction, continues the sequential run.
-	readAheadNear = int64(4 * fs.Mebi)
+	// The read-ahead is the bytes consumed so far divided by this.
+	readAheadConsumedDivisor = 2
 )
 
-// readAhead is the per-handle access-pattern tracker.
+// readAhead is the per-handle consumption tracker.
 type readAhead struct {
-	mu      sync.Mutex
-	started bool
-	lastEnd int64 // furthest byte the sequential run has reached
-	seq     int   // consecutive sequential reads so far
+	mu        sync.Mutex
+	totalRead int64 // bytes read through this handle
 }
 
 // next records a read of n bytes at off and returns the read-ahead that
@@ -56,19 +58,9 @@ type readAhead struct {
 func (p *readAhead) next(off, n int64) int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.started && off >= p.lastEnd-readAheadNear && off <= p.lastEnd+readAheadNear {
-		p.seq++
-		p.lastEnd = max(p.lastEnd, off+n)
-	} else {
-		p.seq = 0
-		p.lastEnd = off + n
-	}
-	p.started = true
-	ra := int64(readAheadMin)
-	for s := p.seq; s >= readAheadStep && ra < int64(readAheadMax); s -= readAheadStep {
-		ra *= 4
-	}
-	return min(ra, int64(readAheadMax))
+	p.totalRead += n
+	ra := p.totalRead / readAheadConsumedDivisor
+	return min(max(ra, int64(readAheadMin)), int64(readAheadMax))
 }
 
 // readAheadSetter is implemented by vfs.RWFileHandle (fork addition). Handles

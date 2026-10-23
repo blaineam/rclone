@@ -11,53 +11,65 @@ import (
 	"github.com/rclone/rclone/fs/config"
 )
 
-// TestReadAheadGrowsWithSequentialReadsAndResetsOnSeek pins the policy: a
-// fresh handle and a seek get the minimum, sequential runs grow it by four
-// every readAheadStep reads, and the ceiling holds.
-func TestReadAheadGrowsWithSequentialReadsAndResetsOnSeek(t *testing.T) {
-	var p readAhead
+func TestReadAheadFollowsBytesConsumed(t *testing.T) {
 	const n = 64 * 1024
+	mib := int64(fs.Mebi)
 	want := func(got, want int64, what string) {
 		t.Helper()
 		if got != want {
 			t.Fatalf("%s: read-ahead %d, want %d", what, got, want)
 		}
 	}
-	// First read on the handle.
-	want(p.next(0, n), int64(readAheadMin), "first read")
-	// Reads 2..4 of the run stay at the minimum; the 5th (seq == 4) grows.
-	off := int64(n)
-	for i := 1; i < readAheadStep; i++ {
-		want(p.next(off, n), int64(readAheadMin), "early sequential read")
-		off += n
+
+	// A probe: one small read costs the floor.
+	var probe readAhead
+	want(probe.next(0, n), 2*mib, "first read")
+
+	// A metadata parse: 273 reads of 64KiB with jumps in both directions
+	// (the recorded AVFoundation pattern's shape) never earns more than half
+	// of what it consumed, so it cannot look like a stream and fetch the
+	// ceiling.
+	var parse readAhead
+	var last int64
+	offs := []int64{0, 512 * 1024, 1536 * 1024, 3 * mib, 128 * 1024}
+	for i := 0; i < 273; i++ {
+		last = parse.next(offs[i%len(offs)]+int64(i)*n, n)
 	}
-	want(p.next(off, n), 4*int64(readAheadMin), "after one step")
-	off += n
-	for i := 1; i < readAheadStep; i++ {
-		p.next(off, n)
-		off += n
+	consumed := int64(273 * n)
+	want(last, max(consumed/2, 2*mib), "parse window is half of what it read")
+	if last > 16*mib {
+		t.Fatalf("a 17 MiB parse got a %d window", last)
 	}
-	want(p.next(off, n), 16*int64(readAheadMin), "after two steps")
-	off += n
-	for i := 0; i < 20*readAheadStep; i++ {
-		got := p.next(off, n)
-		if got > int64(readAheadMax) {
-			t.Fatalf("read-ahead %d exceeded the ceiling %d", got, readAheadMax)
+
+	// A stream: 1MiB reads double the window with their consumption and
+	// reach the ceiling at 256 MiB read, never above it.
+	var stream readAhead
+	var off int64
+	for i := 1; i <= 300; i++ {
+		got := stream.next(off, mib)
+		off += mib
+		switch {
+		case int64(i) < 4:
+			want(got, 2*mib, "early stream read stays at the floor")
+		case int64(i) <= 256:
+			want(got, int64(i)*mib/2, "stream window is half of what it read")
+		default:
+			want(got, 128*mib, "stream holds the ceiling")
 		}
-		off += n
 	}
-	want(p.next(off, n), int64(readAheadMax), "long run reaches the ceiling")
-	// A seek far away resets to the minimum.
-	want(p.next(off+int64(100*fs.Mebi), n), int64(readAheadMin), "after a seek")
-	// A page re-read just behind the run's end is not a seek.
-	off = off + int64(100*fs.Mebi) + n
-	for i := 0; i < readAheadStep; i++ {
-		p.next(off, n)
-		off += n
+
+	// A bulk reader that seeks: the window depends on consumption only, so
+	// a jump far away changes nothing.
+	want(stream.next(5*1024*mib, n), 128*mib, "seek after 300 MiB keeps the ceiling")
+	var seeky readAhead
+	for i := 0; i < 64; i++ {
+		last = seeky.next(int64(i)*32*mib, n)
 	}
-	want(p.next(off-2*n, n), 4*int64(readAheadMin), "re-read behind the run")
-	// A read within readAheadNear ahead continues the run too.
-	want(p.next(off+readAheadNear/2, n), 4*int64(readAheadMin), "small forward gap")
+	want(last, 2*mib, "seeking reader stays at the floor while it has read little")
+	for i := 64; i < 64+512; i++ {
+		last = seeky.next(int64(i)*32*mib, n)
+	}
+	want(last, 18*mib, "seeking reader that has read 36 MiB gets 18 MiB regardless of seeks")
 }
 
 // cacheBlocksOf returns how many bytes of the one file under the VFS cache
