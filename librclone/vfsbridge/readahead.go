@@ -86,6 +86,12 @@ type readAheadSetter interface {
 // drains it to disk far faster than any backend fills it.
 var cachedBufferSize = fs.SizeSuffix(2 * fs.Mebi)
 
+// fastFingerprint is whether cached files are fingerprinted by size and
+// modtime only (true) or also by a hash the backend computes (false,
+// rclone's default). See AddRemote. Only a test sets it to false, to show
+// what the hash costs.
+var fastFingerprint = true
+
 // readAheadAdaptive switches the per-read policy off, so every read uses
 // readAheadMax exactly as the fixed 128MiB setting did. Only the measurement
 // test flips it, to produce the "before" numbers in the same binary.

@@ -42,6 +42,10 @@ type Server struct {
 	// the synthetic root reports as its mtime. Held separately from generation
 	// because a counter is not a timestamp and clients compare mtimes.
 	rootModTime atomic.Int64
+	// statfs is the last volume statistics computed, refreshed in the
+	// background; see doStatFS.
+	statfs     atomic.Pointer[statfsCache]
+	statfsBusy atomic.Bool
 	// prefetchSlots caps how many speculative directory reads run at once.
 	// Buffered to prefetchConcurrency; a non-blocking send is the admission
 	// test, so a full buffer drops the prefetch instead of queueing it.
@@ -135,6 +139,23 @@ func (s *Server) AddRemote(remoteName string) (retErr error) {
 	opt.WriteBack = fs.Duration(bridgeWriteBack)
 	opt.DirCacheTime = fs.Duration(5 * time.Minute)
 	opt.PollInterval = fs.Duration(1 * time.Minute)
+
+	// Fingerprint cached files by size and modtime only, never by hash.
+	//
+	// rclone's default fingerprint includes the file's hash on any backend
+	// that can produce one, and the cache computes it inside Item.Open, that
+	// is on the FIRST READ of every file. On SFTP that hash is `md5sum` run
+	// over the whole file on the server, so the first read of a 4GB film
+	// waited out a remote hash of 4GB, and did so holding the item's lock.
+	// File.Size and File.ModTime on every OTHER file of that remote queued
+	// behind that lock through the cache (see vfscache.Cache.DirtyItem), so
+	// one film being opened turned every lookup and getattr on the remote
+	// into a multi-second stall. Measured on the live volume while Sami
+	// opened films: getattr 3-9s, close 5-9s, first reads past the 10s
+	// timeout; a warm walk of 1,075 files averaged 25ms per operation
+	// against 0.2ms on an idle volume. The size+modtime fingerprint is
+	// what rclone recommends for such backends (--vfs-fast-fingerprint).
+	opt.FastFingerprint = fastFingerprint
 
 	// How far the cache downloader runs AHEAD of each read. Decided PER READ
 	// from the handle's access pattern (readahead.go); this option is only the
@@ -472,7 +493,13 @@ func (s *Server) handleConnection(conn net.Conn) {
 			continue
 		}
 
+		started := time.Now()
 		resp := s.handleRequest(&req)
+		// How long the handler took, so the FSKit side can log the split
+		// between its own round trip and the bridge's work without a second
+		// channel. Microseconds: a warm lookup is well under one millisecond
+		// and a count of whole milliseconds would read as zero.
+		resp.Micros = time.Since(started).Microseconds()
 
 		respData, err := json.Marshal(resp)
 		if err != nil {
@@ -536,6 +563,10 @@ type Response struct {
 	// side learns that a remote appeared or disappeared from traffic it was
 	// making anyway, with no polling and no extra round trip.
 	Gen uint64 `json:"gen,omitempty"`
+	// Micros is how long the handler took, in microseconds, measured from
+	// the request being decoded to the reply being ready to encode. Logged by
+	// BridgeClient next to its own round-trip time.
+	Micros int64 `json:"us,omitempty"`
 }
 
 // ItemInfo is the JSON representation of a file/directory.
@@ -750,7 +781,66 @@ func (s *Server) dispatch(req *Request) *Response {
 	}
 }
 
+// statfsCache is one computed set of volume statistics and when it was
+// computed.
+type statfsCache struct {
+	info StatFSInfo
+	at   time.Time
+	gen  uint64
+}
+
+// How long volume statistics are served from the last computation before a
+// refresh is started. Matches the VFS's own About cache (DirCacheTime), so a
+// refresh here is what makes the VFS ask the backends again.
+const statfsRefresh = 5 * time.Minute
+
 func (s *Server) doStatFS(req *Request) *Response {
+	// Never block a statfs on the backends.
+	//
+	// vfs.Statfs asks each remote's About every DirCacheTime, holding the
+	// VFS's usage lock while it does, and a statfs here summed every remote
+	// in turn. With a dozen remotes that was 2-8s once every five minutes,
+	// measured on the live volume -- and the kernel calls statfs for every
+	// getmntinfo(3), so for those seconds `mount`, Finder and every other
+	// caller of the mount table hung machine-wide behind this one request.
+	// The harness's own mount-table probe aborted on it twice.
+	//
+	// So the figures are computed off the request path. A statfs returns
+	// the last computed set at once, and if that is older than
+	// statfsRefresh (or the remote set changed) it starts one refresh in
+	// the background. Only the very first statfs after the server starts
+	// computes synchronously, because there is nothing to serve yet.
+	gen := s.generation.Load()
+	if c := s.statfs.Load(); c != nil {
+		if time.Since(c.at) > statfsRefresh || c.gen != gen {
+			s.refreshStatFSInBackground(gen)
+		}
+		return okResp(req.ID, c.info)
+	}
+	if !s.statfsBusy.CompareAndSwap(false, true) {
+		// Another request is computing the first set; answer unknown rather
+		// than queue behind the backends.
+		return okResp(req.ID, StatFSInfo{})
+	}
+	defer s.statfsBusy.Store(false)
+	return okResp(req.ID, s.computeStatFS(gen))
+}
+
+// refreshStatFSInBackground recomputes the volume statistics once, unless a
+// computation is already running.
+func (s *Server) refreshStatFSInBackground(gen uint64) {
+	if !s.statfsBusy.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer s.statfsBusy.Store(false)
+		s.computeStatFS(gen)
+	}()
+}
+
+// computeStatFS sums the statistics of every exposed remote, which may wait
+// on the backends, and records the result.
+func (s *Server) computeStatFS(gen uint64) StatFSInfo {
 	// Sum across every mounted remote. The old form reported getFirstVFS()'s
 	// figures as the whole volume's, and "first" is arbitrary Go map iteration
 	// order -- so on a multi-remote volume `df` reported one randomly chosen
@@ -761,10 +851,6 @@ func (s *Server) doStatFS(req *Request) *Response {
 		vfses = append(vfses, v)
 	}
 	s.mu.RUnlock()
-
-	if len(vfses) == 0 {
-		return okResp(req.ID, StatFSInfo{})
-	}
 
 	var totalSum, usedSum, freeSum uint64
 	for _, v := range vfses {
@@ -781,9 +867,9 @@ func (s *Server) doStatFS(req *Request) *Response {
 			freeSum += uint64(free)
 		}
 	}
-	return okResp(req.ID, StatFSInfo{
-		TotalBytes: totalSum, FreeBytes: freeSum, UsedBytes: usedSum,
-	})
+	info := StatFSInfo{TotalBytes: totalSum, FreeBytes: freeSum, UsedBytes: usedSum}
+	s.statfs.Store(&statfsCache{info: info, at: time.Now(), gen: gen})
+	return info
 }
 
 func (s *Server) doActivate(req *Request) *Response {

@@ -161,9 +161,17 @@ func TestStatFS(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	r = mustOK(t, s.handleRequest(rawReq(2, "statfs", "")), "statfs empty")
-	if info := r.Result.(StatFSInfo); info != (StatFSInfo{}) {
-		t.Fatalf("statfs with no remotes = %+v, want zeros", info)
+	// Figures are recomputed off the request path after the remote set
+	// changes (doStatFS), so the zeros arrive on a later statfs.
+	var info2 StatFSInfo
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		r = mustOK(t, s.handleRequest(rawReq(2, "statfs", "")), "statfs empty")
+		if info2 = r.Result.(StatFSInfo); info2 == (StatFSInfo{}) {
+			break
+		}
+	}
+	if info2 != (StatFSInfo{}) {
+		t.Fatalf("statfs with no remotes = %+v, want zeros", info2)
 	}
 }
 

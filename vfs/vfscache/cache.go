@@ -337,8 +337,14 @@ func (c *Cache) InUse(name string) bool {
 func (c *Cache) DirtyItem(name string) (item *Item) {
 	name = clean(name)
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	item = c.item[name]
+	c.mu.Unlock()
+	// Enter Space fork: ask the item with the cache lock RELEASED. Upstream
+	// held c.mu across item.IsDirty, which takes item.mu, and item.mu is
+	// held for as long as that item's Open takes. File.Size and File.ModTime
+	// come through here for every getattr and lookup on the VFS, so one
+	// file with a slow open stalled every metadata operation on the remote
+	// behind it, not just its own.
 	if item != nil && !item.IsDirty() {
 		item = nil
 	}
