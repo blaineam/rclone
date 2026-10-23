@@ -57,6 +57,7 @@ const (
 type countingProxy struct {
 	ln        net.Listener
 	fromBack  atomic.Int64
+	toBack    atomic.Int64 // bytes the client sent to the backend
 	requests  atomic.Int64
 	rateBytes int64         // bytes per second from the backend, 0 = unlimited
 	latency   time.Duration // added before the first bytes of each response
@@ -134,6 +135,7 @@ func (p *countingProxy) serve(c net.Conn, backend string) {
 			if n > 0 {
 				seen.Add(1)
 				p.requests.Add(1)
+				p.toBack.Add(int64(n))
 				if _, werr := b.Write(buf[:n]); werr != nil {
 					break
 				}
@@ -183,6 +185,7 @@ func (p *countingProxy) settled(quiet, max time.Duration) int64 {
 
 func (p *countingProxy) reset() {
 	p.fromBack.Store(0)
+	p.toBack.Store(0)
 	p.requests.Store(0)
 	p.rateMu.Lock()
 	p.rateStart, p.rateSent = time.Time{}, 0

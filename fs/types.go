@@ -367,6 +367,32 @@ type WriterAtCloser interface {
 	io.Closer
 }
 
+// RangeWriter is an existing object held open for writes at arbitrary
+// offsets, returned by the OpenRangeWriter feature.
+//
+// Unlike WriterAtCloser (from OpenWriterAt), nothing is truncated when it
+// is opened: the object keeps every byte that is not written over. A write
+// past the end extends the object; Truncate sets its size either way. When
+// WriteAt returns the bytes have been accepted by the backend; Sync, where
+// the backend can promise it, completes once they are on stable storage
+// and is a no-op where it cannot. Close releases the handle and the
+// object's metadata (size, modtime) reflects the writes afterwards.
+//
+// A RangeWriter may also implement io.ReaderAt. Callers that read the object
+// while it is open for editing (a read-write file handle) prefer that over
+// Object.Open: it reads exactly the bytes asked for, where a backend's
+// streaming reader may fetch a window far past a small read.
+type RangeWriter interface {
+	io.WriterAt
+	// Truncate sets the size of the object, cutting it short or extending
+	// it with zeros.
+	Truncate(size int64) error
+	// Sync completes when the bytes written so far are on stable storage,
+	// or at once when the backend cannot promise that.
+	Sync() error
+	io.Closer
+}
+
 type unknownFs struct{}
 
 // Name of the remote (as passed into NewFs)

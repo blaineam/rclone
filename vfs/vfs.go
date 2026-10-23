@@ -172,6 +172,7 @@ var (
 	_ Handle     = (*baseHandle)(nil)
 	_ Handle     = (*ReadFileHandle)(nil)
 	_ Handle     = (*WriteFileHandle)(nil)
+	_ Handle     = (*RangeFileHandle)(nil)
 	_ Handle     = (*DirHandle)(nil)
 	_ billy.File = (Handle)(nil)
 )

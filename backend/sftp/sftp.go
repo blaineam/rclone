@@ -2914,6 +2914,175 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	return nil
 }
 
+// OpenRangeWriter opens an existing file for writes at arbitrary offsets.
+//
+// The file is opened write-only without O_TRUNC, so every byte not written
+// over stays as it was and an in-place edit costs the bytes patched: the
+// SFTP protocol's WRITE carries an offset, and pkg/sftp's File.WriteAt
+// sends it in chunk_size pieces. Write-only, not read-write, because
+// rclone's own `serve sftp` (and any pkg/sftp request server without an
+// OpenFile handler) refuses reads on a handle opened for writing; reads go
+// through Object.Open as usual.
+//
+// The SSH connection is held for the life of the handle, as Update does,
+// so the handle's writes never interleave with another transfer on it.
+func (f *Fs) OpenRangeWriter(ctx context.Context, remote string) (fs.RangeWriter, error) {
+	obj, err := f.NewObject(ctx, remote)
+	if err != nil {
+		return nil, err
+	}
+	o := obj.(*Object)
+	f.addSession() // Show session in use
+	c, err := f.getSftpConnection(ctx)
+	if err != nil {
+		f.removeSession()
+		return nil, fmt.Errorf("OpenRangeWriter: %w", err)
+	}
+	file, err := c.sftpClient.OpenFile(o.path(), os.O_WRONLY)
+	if err != nil {
+		f.putSftpConnection(&c, err)
+		f.removeSession()
+		return nil, fmt.Errorf("OpenRangeWriter: open failed: %w", err)
+	}
+	// Hashes cached for the old content are wrong from the first write on.
+	o.md5sum = nil
+	o.sha1sum = nil
+	o.crc32sum = nil
+	o.sha256sum = nil
+	o.blake3sum = nil
+	o.xxh3sum = nil
+	o.xxh128sum = nil
+	return &rangeWriter{ctx: ctx, o: o, c: c, file: file}, nil
+}
+
+// rangeWriter is the fs.RangeWriter for an sftp file.
+type rangeWriter struct {
+	ctx  context.Context
+	o    *Object
+	c    *conn
+	file *sftp.File
+	// reader is a read-only handle on the same file and connection, opened
+	// by the first ReadAt: pkg/sftp's File.ReadAt fetches exactly the bytes
+	// asked for, where Object.Open's streaming reader pulls a window of
+	// about 2 MiB ahead of a small read.
+	reader *sftp.File
+	mu     sync.Mutex
+	// err is the first error a write or truncate returned; it decides
+	// whether the connection goes back to the pool on Close.
+	err    error
+	closed bool
+}
+
+// WriteAt writes p at off; the bytes are on the server when it returns.
+func (w *rangeWriter) WriteAt(p []byte, off int64) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return 0, os.ErrClosed
+	}
+	n, err := w.file.WriteAt(p, off)
+	if err != nil {
+		w.remember(err)
+		return n, fmt.Errorf("OpenRangeWriter: write at %d failed: %w", off, err)
+	}
+	return n, nil
+}
+
+// ReadAt reads exactly len(p) bytes at off from the file as it is now.
+func (w *rangeWriter) ReadAt(p []byte, off int64) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return 0, os.ErrClosed
+	}
+	if w.reader == nil {
+		r, err := w.c.sftpClient.Open(w.o.path())
+		if err != nil {
+			w.remember(err)
+			return 0, fmt.Errorf("OpenRangeWriter: open for reading failed: %w", err)
+		}
+		w.reader = r
+	}
+	n, err := w.reader.ReadAt(p, off)
+	if err != nil && err != io.EOF {
+		w.remember(err)
+		return n, fmt.Errorf("OpenRangeWriter: read at %d failed: %w", off, err)
+	}
+	return n, err
+}
+
+// Truncate sets the file's size (SSH_FXP_FSETSTAT on the open handle).
+func (w *rangeWriter) Truncate(size int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return os.ErrClosed
+	}
+	if err := w.file.Truncate(size); err != nil {
+		w.remember(err)
+		return fmt.Errorf("OpenRangeWriter: truncate to %d failed: %w", size, err)
+	}
+	return nil
+}
+
+// Sync asks the server to flush the file to disk (fsync@openssh.com). A
+// server without that extension gets a no-op: every write has already been
+// acknowledged by the server, which is as much as SFTP promises.
+func (w *rangeWriter) Sync() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return os.ErrClosed
+	}
+	err := w.file.Sync()
+	if err == nil {
+		return nil
+	}
+	var statusErr *sftp.StatusError
+	if errors.As(err, &statusErr) && statusErr.FxCode() == sftp.ErrSSHFxOpUnsupported {
+		fs.Debugf(w.o, "OpenRangeWriter: server has no fsync extension; sync is a no-op")
+		return nil
+	}
+	w.remember(err)
+	return fmt.Errorf("OpenRangeWriter: sync failed: %w", err)
+}
+
+// Close releases the handle and the connection and re-reads the file's
+// size and modtime, so the object describes what is on the server now.
+func (w *rangeWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return os.ErrClosed
+	}
+	w.closed = true
+	defer w.o.fs.removeSession()
+	err := w.file.Close()
+	if err != nil {
+		w.remember(err)
+		err = fmt.Errorf("OpenRangeWriter: close failed: %w", err)
+	}
+	if w.reader != nil {
+		if rerr := w.reader.Close(); rerr != nil {
+			w.remember(rerr)
+			if err == nil {
+				err = fmt.Errorf("OpenRangeWriter: closing the read handle failed: %w", rerr)
+			}
+		}
+	}
+	w.o.fs.putSftpConnection(&w.c, w.err)
+	if statErr := w.o.stat(w.ctx); statErr != nil && err == nil {
+		err = fmt.Errorf("OpenRangeWriter: stat after close failed: %w", statErr)
+	}
+	return err
+}
+
+func (w *rangeWriter) remember(err error) {
+	if w.err == nil {
+		w.err = err
+	}
+}
+
 // Remove a remote sftp file object
 func (o *Object) Remove(ctx context.Context) error {
 	c, err := o.fs.getSftpConnection(ctx)
@@ -2927,15 +3096,16 @@ func (o *Object) Remove(ctx context.Context) error {
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs             = &Fs{}
-	_ fs.PutStreamer    = &Fs{}
-	_ fs.Mover          = &Fs{}
-	_ fs.Copier         = &Fs{}
-	_ fs.DirMover       = &Fs{}
-	_ fs.DirSetModTimer = &Fs{}
-	_ fs.Abouter        = &Fs{}
-	_ fs.Shutdowner     = &Fs{}
-	_ fs.Object         = &Object{}
+	_ fs.Fs              = &Fs{}
+	_ fs.PutStreamer     = &Fs{}
+	_ fs.Mover           = &Fs{}
+	_ fs.Copier          = &Fs{}
+	_ fs.DirMover        = &Fs{}
+	_ fs.DirSetModTimer  = &Fs{}
+	_ fs.Abouter         = &Fs{}
+	_ fs.Shutdowner      = &Fs{}
+	_ fs.OpenRangeWriter = &Fs{}
+	_ fs.Object          = &Object{}
 )
 
 // isShellNoSuchFile reports whether a shell command failed because the path

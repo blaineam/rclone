@@ -128,29 +128,13 @@ func TestStreamingOverwriteReplacesTheFile(t *testing.T) {
 	}
 }
 
-// What streaming cannot do must fail loudly, not corrupt: an in-place edit of a file that has
-// content (refused at the first write, the remote file untouched), and a write that does not
-// continue where the last one ended.
-func TestStreamingRefusesInPlaceEditsAndNonSequentialWrites(t *testing.T) {
-	s, backingA := streamingServer(t)
+// What a streaming upload cannot do must fail loudly, not corrupt: a write that does not
+// continue where the last one ended leaves no hole. (An in-place edit of a file that has
+// content is no longer refused where the backend can write at an offset -- see
+// rangewrite_test.go for both the edit and the refusal where it cannot.)
+func TestStreamingRefusesNonSequentialWrites(t *testing.T) {
+	s, _ := streamingServer(t)
 	dir := remoteRootID(t, s, "rem_a")
-	if err := os.WriteFile(filepath.Join(backingA, "existing.txt"), []byte("already here"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// Re-list so the bridge sees it.
-	existing := childID(t, s, dir, "existing.txt")
-
-	// rclone opens a streaming handle lazily, so the open itself succeeds; the refusal comes at
-	// the first write. Either way the file on the remote must be left exactly as it was.
-	if r := s.handleRequest(req(t, 1, "open", map[string]any{"itemId": existing, "write": true})); r.Ok {
-		if w := s.handleRequest(req(t, 9, "write", map[string]any{"itemId": existing, "offset": 0, "data": []byte("clobbered")})); w.Ok {
-			t.Fatal("an in-place write to a file that has content succeeded on a streaming remote")
-		}
-		_ = s.handleRequest(req(t, 10, "close", map[string]any{"itemId": existing}))
-	}
-	if got, _ := os.ReadFile(filepath.Join(backingA, "existing.txt")); string(got) != "already here" {
-		t.Fatalf("a refused in-place write changed the file: %q", got)
-	}
 
 	c := mustOK(t, s.handleRequest(req(t, 2, "create",
 		map[string]any{"dirId": dir, "name": "seq.bin", "isDir": false})), "create")

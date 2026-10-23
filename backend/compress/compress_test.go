@@ -107,7 +107,7 @@ var defaultOpt = fstests.Opt{
 	RemoteName: "TestCompress:",
 	NilObject:  (*Object)(nil),
 	UnimplementableFsMethods: []string{
-		"OpenWriterAt",
+		"OpenWriterAt", "OpenRangeWriter",
 		"OpenChunkWriter",
 		"MergeDirs",
 		"DirCacheFlush",

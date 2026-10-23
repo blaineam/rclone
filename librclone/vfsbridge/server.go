@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -252,6 +253,14 @@ func (s *Server) buildVFS(remoteName string, unshared bool) (*vfs.VFS, RemoteMod
 		if f.Features().PutStream != nil {
 			opt.CacheMode = vfscommon.CacheModeOff
 			mode = RemoteMode{Mode: "through"}
+			// With no cache, an existing file can still be edited in place when the
+			// backend can write at an offset (sftp, local): the VFS then serves such
+			// an open with a RangeFileHandle whose writes go to the remote as ranged
+			// writes, so a few MB of tags patched into a 2.5 GB film cost a few MB,
+			// not a refusal and not the film. Where the backend cannot (object
+			// stores, crypt), the open stays EPERM and the VFS logs why.
+			opt.RangeWrites = true
+			mode.InPlace = f.Features().OpenRangeWriter != nil
 			// rclone reads the stream through an async buffer (16MiB by default), which would
 			// let the writer run that far ahead of the upload and leave close waiting out the
 			// tail. Keep it small.
@@ -814,6 +823,17 @@ func (s *Server) dispatch(req *Request) *Response {
 		// These are durability points. Returning ok without flushing meant a
 		// file written just before an unmount -- or before the app quit -- was
 		// reported as safely stored and then silently dropped with the cache.
+		//
+		// A file open for an in-place edit (vfs.RangeFileHandle) is not waited
+		// for: its writes are already on the remote, and fsync(2) from a program
+		// that keeps the file open between its writes -- Lathe's moov patch --
+		// must come back when the remote has the bytes, not when the program
+		// eventually closes. It is told to flush instead, and a flush that fails
+		// fails the sync.
+		if err := s.handles.SyncInPlace(); err != nil {
+			fs.Errorf(nil, "VFS bridge: %s: flushing an in-place edit failed: %v", req.Op, err)
+			return errorResp(req.ID, mapVFSErr(err))
+		}
 		s.WaitForWriters(shutdownFlushTimeout)
 		return okResp(req.ID, nil)
 	case "activate":
@@ -1469,7 +1489,21 @@ func (s *Server) doOpen(req *Request) *Response {
 
 	handle, err := node.Open(flags)
 	if err != nil {
+		if args.Write && errors.Is(err, vfs.EPERM) && node.VFS().Opt.CacheMode == vfscommon.CacheModeOff {
+			fs.Errorf(nil, "VFS bridge: open for writing of %q refused (EPERM): the remote streams writes and cannot edit a file in place; the file can only be replaced whole", node.Path())
+		}
 		return errorResp(req.ID, mapVFSErr(err))
+	}
+	if _, inPlace := handle.(*vfs.RangeFileHandle); inPlace {
+		// Reads must see the bytes this handle writes. A read handle the bridge
+		// opened on its own (doRead) reads the remote through its own buffer,
+		// which could hand back bytes from before a patch; drop those now, so
+		// reads pick this handle (the newest) and go to the live object.
+		for _, h := range s.handles.PopLazy(args.ItemID) {
+			if err := h.Close(); err != nil {
+				fs.Errorf(nil, "VFS bridge: closing lazy read handle of item %d: %v", args.ItemID, err)
+			}
+		}
 	}
 	s.handles.Put(args.ItemID, handle, args.Write)
 	return okResp(req.ID, nil)

@@ -1849,6 +1849,52 @@ func (f *Fs) OpenWriterAt(ctx context.Context, remote string, size int64) (fs.Wr
 	return out, nil
 }
 
+// OpenRangeWriter opens an existing file for writes at arbitrary offsets,
+// without truncating it. See fs.Features.OpenRangeWriter.
+func (f *Fs) OpenRangeWriter(ctx context.Context, remote string) (fs.RangeWriter, error) {
+	obj, err := f.NewObject(ctx, remote)
+	if err != nil {
+		return nil, err
+	}
+	o := obj.(*Object)
+	if o.translatedLink {
+		return nil, errors.New("can't open a symlink for random writing")
+	}
+	fd, err := f.openFile(o.path, os.O_RDWR, 0)
+	if err != nil {
+		return nil, err
+	}
+	return &rangeWriter{o: o, fd: fd}, nil
+}
+
+// rangeWriter is the fs.RangeWriter for a local file: the *os.File with the
+// object's metadata re-read on Close.
+type rangeWriter struct {
+	o  *Object
+	fd *os.File
+}
+
+// WriteAt writes p at off.
+func (w *rangeWriter) WriteAt(p []byte, off int64) (int, error) { return w.fd.WriteAt(p, off) }
+
+// ReadAt reads len(p) bytes at off.
+func (w *rangeWriter) ReadAt(p []byte, off int64) (int, error) { return w.fd.ReadAt(p, off) }
+
+// Truncate sets the file's size.
+func (w *rangeWriter) Truncate(size int64) error { return w.fd.Truncate(size) }
+
+// Sync flushes the file to disk.
+func (w *rangeWriter) Sync() error { return w.fd.Sync() }
+
+// Close closes the file and refreshes the object's size and modtime.
+func (w *rangeWriter) Close() error {
+	err := w.fd.Close()
+	if statErr := w.o.lstat(); statErr != nil && err == nil {
+		err = statErr
+	}
+	return err
+}
+
 // setMetadata sets the file info from the os.FileInfo passed in
 func (o *Object) setMetadata(info os.FileInfo) {
 	// if not checking updated then don't update the stat
@@ -2032,6 +2078,7 @@ var (
 	_ fs.DirMover        = &Fs{}
 	_ fs.Commander       = &Fs{}
 	_ fs.OpenWriterAter  = &Fs{}
+	_ fs.OpenRangeWriter = &Fs{}
 	_ fs.DirSetModTimer  = &Fs{}
 	_ fs.MkdirMetadataer = &Fs{}
 	_ fs.Object          = &Object{}

@@ -349,7 +349,22 @@ func (f *File) delWriter(h Handle) {
 // Note that we don't take the mutex here.  If we do then we can get a
 // deadlock.
 func (f *File) activeWriters() int {
-	return int(f.nwriters.Load())
+	n := int(f.nwriters.Load())
+	if n == 0 {
+		return 0
+	}
+	// An in-place edit (RangeFileHandle) has nothing in flight: each of its
+	// writes was on the backend before it returned. Waiting for it to close
+	// would hold up every durability point -- fsync(2) above all -- for as
+	// long as the program keeps the file open, for nothing.
+	f.mu.RLock()
+	for _, w := range f.writers {
+		if _, ok := w.(*RangeFileHandle); ok {
+			n--
+		}
+	}
+	f.mu.RUnlock()
+	return n
 }
 
 // _roundModTime rounds the time passed in to the Precision of the
@@ -890,6 +905,11 @@ func (f *File) Open(flags int) (fd Handle, err error) {
 	CacheMode := d.vfs.Opt.CacheMode
 	if CacheMode >= vfscommon.CacheModeMinimal && (d.vfs.cache.InUse(f.CachePath()) || d.vfs.cache.Exists(f.CachePath())) {
 		fd, err = f.openRW(flags)
+	} else if write && rangeOpenWanted(&d.vfs.Opt, flags, f.exists()) {
+		// An in-place edit with no cache: write at offsets on the backend
+		// itself, where it can (see RangeFileHandle), and EPERM where it
+		// cannot rather than a WriteFileHandle that fails at its first write.
+		fd, err = f.openRange()
 	} else if read && write {
 		if CacheMode >= vfscommon.CacheModeMinimal {
 			fd, err = f.openRW(flags)

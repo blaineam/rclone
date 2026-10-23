@@ -72,6 +72,12 @@ type RemoteMode struct {
 	Mode string `json:"mode"`
 	// Note explains a request that could not be honoured.
 	Note string `json:"note,omitempty"`
+	// InPlace is set when an existing file on a streaming remote can be
+	// edited in place: writes at an offset go straight to the remote as
+	// ranged writes, so a patch costs the bytes patched (vfs.RangeFileHandle).
+	// Off, a streaming remote can only replace a file whole and refuses an
+	// open for writing of a file that has content (EPERM).
+	InPlace bool `json:"inPlace,omitempty"`
 }
 
 // SetWriteThrough records whether remote should stream its writes. It applies the next
@@ -153,6 +159,9 @@ type RemoteUploads struct {
 	// the remote could not honour.
 	WriteMode     string `json:"writeMode"`
 	WriteModeNote string `json:"writeModeNote,omitempty"`
+	// WriteInPlace: a streaming remote whose existing files can be edited in
+	// place with ranged writes (see RemoteMode.InPlace).
+	WriteInPlace bool `json:"writeInPlace,omitempty"`
 }
 
 // UploadStatus is the upload queue of every exposed remote.
@@ -186,7 +195,7 @@ func (s *Server) UploadStatus() UploadStatus {
 		ru := RemoteUploads{Remote: name, Items: []UploadItem{}, WriteMode: "cached"}
 		s.mu.RLock()
 		if m, ok := s.remoteModes[name]; ok {
-			ru.WriteMode, ru.WriteModeNote = m.Mode, m.Note
+			ru.WriteMode, ru.WriteModeNote, ru.WriteInPlace = m.Mode, m.Note, m.InPlace
 		}
 		s.mu.RUnlock()
 		for _, q := range v.UploadQueue() {

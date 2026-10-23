@@ -294,3 +294,140 @@ func TestMeasureNASWrite(t *testing.T) {
 		})
 	}
 }
+
+// TestMeasureNASInPlace times Lathe's in-place moov rewrite against the
+// server named by ES_VFSBRIDGE_NAS, in streaming mode: a probe file of
+// ES_VFSBRIDGE_NAS_MIB MiB (default 256) is written into
+// ES_VFSBRIDGE_NAS_WRITE_DIR first, then opened for writing as an existing
+// file and edited with ranged writes -- a 2.5 MB block appended, fsync, 8
+// bytes patched in the middle, fsync, the tail cut, the patch read back --
+// each step timed. The probe is removed afterwards. Compare with
+// TestMeasureNASWrite, which is what replacing the file whole costs.
+func TestMeasureNASInPlace(t *testing.T) {
+	spec := os.Getenv("ES_VFSBRIDGE_NAS")
+	if spec == "" {
+		t.Skip("set ES_VFSBRIDGE_NAS to run the NAS in-place edit measurement")
+	}
+	relDir := os.Getenv("ES_VFSBRIDGE_NAS_WRITE_DIR")
+	if relDir == "" {
+		t.Fatal("set ES_VFSBRIDGE_NAS_WRITE_DIR to a directory relative to the SFTP root")
+	}
+	mib := int64(256)
+	if v := os.Getenv("ES_VFSBRIDGE_NAS_MIB"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mib = n
+	}
+	tmp := t.TempDir()
+	confPath := filepath.Join(tmp, "rclone.conf")
+	var conf strings.Builder
+	conf.WriteString("[nas]\ntype = sftp\nknown_hosts_file = none\nshell_type = unix\n")
+	for _, kv := range strings.Split(spec, ",") {
+		k, v, _ := strings.Cut(kv, "=")
+		fmt.Fprintf(&conf, "%s = %s\n", strings.TrimSpace(k), strings.TrimSpace(v))
+	}
+	for _, extra := range strings.Split(os.Getenv("ES_VFSBRIDGE_NAS_EXTRA"), ";") {
+		if extra = strings.TrimSpace(extra); extra != "" {
+			conf.WriteString(extra + "\n")
+		}
+	}
+	if err := os.WriteFile(confPath, []byte(conf.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.SetConfigPath(confPath)
+	configfile.Install()
+	useTempCacheDir(t)
+
+	s := NewServer()
+	s.SetWriteThrough("nas", true)
+	if err := s.AddRemote("nas"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Stop)
+	if modeOf(s, "nas") != "through" || !inPlaceOf(s, "nas") {
+		t.Fatalf("nas: mode %q in-place %v, want through + in-place", modeOf(s, "nas"), inPlaceOf(s, "nas"))
+	}
+	dir := remoteRootID(t, s, "nas")
+	for _, p := range strings.Split(relDir, "/") {
+		dir = childID(t, s, dir, p)
+	}
+
+	// The probe: a whole-file write, as a copy to the volume does it.
+	buf := make([]byte, fs.Mebi)
+	for i := range buf {
+		buf[i] = byte(i * 13)
+	}
+	name := "es-inplace-probe.bin"
+	r := mustOK(t, s.handleRequest(req(t, 1, "create", map[string]any{"dirId": dir, "name": name, "isDir": false})), "create")
+	id := r.Result.(ItemInfo).ID
+	t.Cleanup(func() {
+		mustOK(t, s.handleRequest(req(t, 99, "remove", map[string]any{"dirId": dir, "itemId": id, "name": name})), "remove the probe")
+	})
+	mustOK(t, s.handleRequest(req(t, 2, "open", map[string]any{"itemId": id, "write": true})), "open")
+	t0 := time.Now()
+	for i := int64(0); i < mib; i++ {
+		mustOK(t, s.handleRequest(req(t, 3, "write", map[string]any{"itemId": id, "offset": i * int64(fs.Mebi), "data": buf})), "write")
+	}
+	mustOK(t, s.handleRequest(req(t, 4, "close", map[string]any{"itemId": id})), "close")
+	whole := time.Since(t0)
+	size := mib * int64(fs.Mebi)
+	t.Logf("probe: %d MiB written whole in %v (%.1f MB/s)", mib, whole.Round(time.Millisecond), float64(size)/1e6/whole.Seconds())
+
+	// The in-place edit, step by step.
+	block := payloadOf(2500<<10, 'M')
+	patch := []byte{0, 0, 0, 8, 'f', 'r', 'e', 'e'}
+	patchAt := size / 2
+	newSize := size + int64(len(block)) - 300<<10
+	var total time.Duration
+	step := func(what string, f func()) {
+		t0 := time.Now()
+		f()
+		d := time.Since(t0)
+		total += d
+		t.Logf("  %-28s %v", what, d.Round(time.Millisecond))
+	}
+	step("open existing for writing", func() {
+		mustOK(t, s.handleRequest(req(t, 10, "open", map[string]any{"itemId": id, "write": true})), "open")
+	})
+	step(fmt.Sprintf("append %d KiB at EOF", len(block)>>10), func() {
+		mustOK(t, s.handleRequest(req(t, 11, "write", map[string]any{"itemId": id, "offset": size, "data": block})), "append")
+	})
+	step("fsync", func() { mustOK(t, s.handleRequest(req(t, 12, "sync", nil)), "sync") })
+	step("write 8 bytes mid-file", func() {
+		mustOK(t, s.handleRequest(req(t, 13, "write", map[string]any{"itemId": id, "offset": patchAt, "data": patch})), "patch")
+	})
+	step("fsync", func() { mustOK(t, s.handleRequest(req(t, 14, "sync", nil)), "sync") })
+	step("truncate", func() {
+		mustOK(t, s.handleRequest(req(t, 15, "setattr", map[string]any{"itemId": id, "size": newSize})), "truncate")
+	})
+	step("read the 8 bytes back", func() {
+		r := mustOK(t, s.handleRequest(req(t, 16, "read", map[string]any{"itemId": id, "offset": patchAt, "length": len(patch)})), "read")
+		if got := r.Result.([]byte); string(got) != string(patch) {
+			t.Fatalf("read back %q", got)
+		}
+	})
+	step("close", func() { mustOK(t, s.handleRequest(req(t, 17, "close", map[string]any{"itemId": id})), "close") })
+	r = mustOK(t, s.handleRequest(req(t, 18, "getattr", map[string]any{"itemId": id})), "getattr")
+	if got := r.Result.(ItemInfo).Size; got != newSize {
+		t.Fatalf("size after the edit %d, want %d", got, newSize)
+	}
+	// Ground truth from the server: the patch, its neighbours, the block's end.
+	for _, c := range []struct {
+		off  int64
+		want []byte
+		what string
+	}{
+		{patchAt - 16, buf[(patchAt-16)%int64(fs.Mebi) : (patchAt-16)%int64(fs.Mebi)+16], "bytes before the patch"},
+		{patchAt + 8, buf[(patchAt+8)%int64(fs.Mebi) : (patchAt+8)%int64(fs.Mebi)+16], "bytes after the patch"},
+		{newSize - 16, payloadOf(16, 'M'), "the block's end at the new size"},
+	} {
+		r := mustOK(t, s.handleRequest(req(t, 19, "read", map[string]any{"itemId": id, "offset": c.off, "length": len(c.want)})), c.what)
+		if got := r.Result.([]byte); string(got) != string(c.want) {
+			t.Fatalf("%s: got %x want %x", c.what, got, c.want)
+		}
+	}
+	t.Logf("in-place edit of a %d MiB file: %d bytes patched in %v; writing the file whole took %v",
+		mib, len(block)+len(patch), total.Round(time.Millisecond), whole.Round(time.Millisecond))
+}

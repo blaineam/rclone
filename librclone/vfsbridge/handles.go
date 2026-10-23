@@ -185,6 +185,30 @@ func (t *HandleTable) PopEverything() []vfs.Handle {
 	return out
 }
 
+// SyncInPlace flushes every open in-place edit (vfs.RangeFileHandle) to its
+// remote and returns the first error. Other handles are left alone: a
+// streaming write handle has nothing to flush short of closing, and a cached
+// one is flushed by the upload queue.
+func (t *HandleTable) SyncInPlace() error {
+	t.mu.RLock()
+	var handles []*vfs.RangeFileHandle
+	for _, entries := range t.handles {
+		for _, e := range entries {
+			if rh, ok := e.h.(*vfs.RangeFileHandle); ok {
+				handles = append(handles, rh)
+			}
+		}
+	}
+	t.mu.RUnlock()
+	var first error
+	for _, rh := range handles {
+		if err := rh.Sync(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
 // HasWriter reports whether any handle for this item was opened for writing.
 func (t *HandleTable) HasWriter(itemID uint64) bool {
 	t.mu.RLock()

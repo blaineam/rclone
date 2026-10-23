@@ -146,6 +146,11 @@ var OptionsInfo = fs.Options{{
 	Help:    "Use fast (less accurate) fingerprints for change detection",
 	Groups:  "VFS",
 }, {
+	Name:    "vfs_range_writes",
+	Default: false,
+	Help:    "With --vfs-cache-mode off, edit existing files in place on backends that can write at an offset (sftp, local)",
+	Groups:  "VFS",
+}, {
 	Name:    "vfs_disk_space_total_size",
 	Default: fs.SizeSuffix(-1),
 	Help:    "Specify the total space of disk",
@@ -213,6 +218,7 @@ type Options struct {
 	ReadAhead          fs.SizeSuffix `config:"vfs_read_ahead"`       // bytes to read ahead in cache mode "full"
 	UsedIsSize         bool          `config:"vfs_used_is_size"`     // if true, use the `rclone size` algorithm for Used size
 	FastFingerprint    bool          `config:"vfs_fast_fingerprint"` // if set use fast fingerprints
+	RangeWrites        bool          `config:"vfs_range_writes"`     // in cache mode off, write into existing files at an offset where the backend can
 	DiskSpaceTotalSize fs.SizeSuffix `config:"vfs_disk_space_total_size"`
 	HandleCaching      fs.Duration   `config:"vfs_handle_caching"`     // time to keep handle alive after last close
 	MetadataExtension  string        `config:"vfs_metadata_extension"` // if set respond to files with this extension with metadata

@@ -191,6 +191,14 @@ type Features struct {
 	//
 	OpenChunkWriter func(ctx context.Context, remote string, src ObjectInfo, options ...OpenOption) (info ChunkWriterInfo, writer ChunkWriter, err error)
 
+	// OpenRangeWriter opens an EXISTING object for writes at arbitrary
+	// offsets, without truncating it: an in-place edit costs the bytes
+	// written, not the object. Returns ErrorObjectNotFound when there is
+	// no such object. Backends whose storage can seek on write (sftp,
+	// local) implement it; wrapping backends that transform the byte
+	// stream (crypt, compress, chunker) must not pass it through.
+	OpenRangeWriter func(ctx context.Context, remote string) (RangeWriter, error)
+
 	// UserInfo returns info about the connected user
 	UserInfo func(ctx context.Context) (map[string]string, error)
 
@@ -354,6 +362,9 @@ func (ft *Features) Fill(ctx context.Context, f Fs) *Features {
 	if do, ok := f.(OpenChunkWriter); ok {
 		ft.OpenChunkWriter = do.OpenChunkWriter
 	}
+	if do, ok := f.(OpenRangeWriter); ok {
+		ft.OpenRangeWriter = do.OpenRangeWriter
+	}
 	if do, ok := f.(UserInfoer); ok {
 		ft.UserInfo = do.UserInfo
 	}
@@ -464,6 +475,9 @@ func (ft *Features) Mask(ctx context.Context, f Fs) *Features {
 	}
 	if mask.OpenChunkWriter == nil {
 		ft.OpenChunkWriter = nil
+	}
+	if mask.OpenRangeWriter == nil {
+		ft.OpenRangeWriter = nil
 	}
 	if mask.UserInfo == nil {
 		ft.UserInfo = nil
@@ -733,6 +747,13 @@ type OpenWriterAter interface {
 
 // OpenWriterAtFn describes the OpenWriterAt function pointer
 type OpenWriterAtFn func(ctx context.Context, remote string, size int64) (WriterAtCloser, error)
+
+// OpenRangeWriter is an optional interface for Fs
+type OpenRangeWriter interface {
+	// OpenRangeWriter opens an existing object for writes at arbitrary
+	// offsets without truncating it. See Features.OpenRangeWriter.
+	OpenRangeWriter(ctx context.Context, remote string) (RangeWriter, error)
+}
 
 // ChunkWriterInfo describes how a backend would like ChunkWriter called
 type ChunkWriterInfo struct {

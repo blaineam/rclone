@@ -229,6 +229,29 @@ Note that if you change the value of this flag, the fingerprints of
 the files in the cache may be invalidated and the files will need to
 be downloaded again.
 
+### VFS Range Writes
+
+With `--vfs-cache-mode off` a file is a stream: it is uploaded from its
+first byte to its last, so an existing file can only be replaced, and an
+open for writing that does not truncate it (an in-place edit) fails with
+EPERM.
+
+The `--vfs-range-writes` flag lets such an open succeed on backends whose
+storage can write at an offset (`local`, `sftp`: the `OpenRangeWriter`
+feature). Each write then goes to the backend as a positioned write of
+exactly the bytes written, a write past the end extends the file, truncate
+sets its size, and `fsync` returns once the backend has the bytes on
+stable storage where it can promise that (SFTP servers with the
+`fsync@openssh.com` extension). Patching a few bytes of metadata into a
+multi-GB file costs those bytes, not the file. Reads of a file open this
+way go to the backend and see the bytes written so far.
+
+Backends that cannot write at an offset (object stores, and the `crypt`,
+`compress` and `chunker` wrappers, where a byte patch would break the
+stored form) still refuse the open with EPERM, and the log says which
+backend refused. Cache modes other than `off` are unaffected: they edit
+the cached copy and upload the whole file on close as before.
+
 ### VFS Chunked Reading
 
 When rclone reads files from a remote it reads them in chunks. This
