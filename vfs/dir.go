@@ -344,6 +344,11 @@ func (d *Dir) countActiveWriters() (writers int) {
 	return writers
 }
 
+// dirNotFoundRetry is how soon a directory whose refresh came back "not
+// found" is asked for again, instead of waiting out DirCacheTime on an
+// empty listing. See _readDir.
+const dirNotFoundRetry = 10 * time.Second
+
 // age returns the duration since the last time the directory contents
 // was read and the content is considered stale. age will be 0 and
 // stale true if the last read time is empty.
@@ -533,9 +538,33 @@ func (d *Dir) _readDir() error {
 		return nil
 	}
 	entries, err := list.DirSorted(d.vfs.ctx, d.f, false, d.path)
+	notFound := false
 	if err == fs.ErrorDirNotFound {
 		// We treat directory not found as empty because we
 		// create directories on the fly
+		//
+		// Enter Space fork: but NOT for a directory this cache has already
+		// listed with entries. Backends report transient failures as "not
+		// found" (sftp maps any os.ErrNotExist from ReadDir to it, and under
+		// load that is what a dropped channel looks like), and treating that
+		// as an empty listing replaced a populated folder with nothing for
+		// the whole DirCacheTime: every lookup under it answered ENOENT from
+		// the cache in microseconds, and the kernel then cached those
+		// negative answers too. Measured on the live volume 2026-10-23: one
+		// enumeration that failed under a Spotlight crawl left "Paid Media"
+		// and everything below it answering "No such file or directory" for
+		// minutes while the remote was fine. Keep the entries we have and ask
+		// again shortly rather than in DirCacheTime.
+		if !d.read.IsZero() && len(d.items) > 0 {
+			fs.Errorf(d.path, "Directory listing reported not found; keeping the %d cached entries and retrying in %v", len(d.items), dirNotFoundRetry)
+			d.read = when.Add(dirNotFoundRetry - time.Duration(d.vfs.Opt.DirCacheTime))
+			return nil
+		}
+		// A directory never listed before, or listed empty, is still treated
+		// as empty - but asked for again in dirNotFoundRetry, not DirCacheTime,
+		// so a first listing that failed under load does not pin "empty" on
+		// the folder for five minutes either.
+		notFound = true
 	} else if err != nil {
 		return err
 	}
@@ -575,6 +604,9 @@ func (d *Dir) _readDir() error {
 	}
 
 	d.read = time.Now()
+	if notFound {
+		d.read = d.read.Add(dirNotFoundRetry - time.Duration(d.vfs.Opt.DirCacheTime))
+	}
 	d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
 
 	return nil
