@@ -1,0 +1,139 @@
+package vfsbridge
+
+// Measurement rig against a real SFTP server, not a pass/fail test.
+//
+// Run with:
+//
+//	ES_VFSBRIDGE_NAS="host=10.0.0.20,port=722,user=blaine,key_file=$HOME/.ssh/blaine" \
+//	ES_VFSBRIDGE_NAS_PATH="FORTRESS/Glacier/Paid Media/Movies/9.mp4" \
+//	RCLONE_CONFIG=/notfound go test -run TestMeasureNASRead -v ./librclone/vfsbridge/
+//
+// It mounts the server as a cached remote on a fresh bridge, exactly as the
+// app does, reads the first ES_VFSBRIDGE_NAS_MIB (default 256) MiB of the
+// file through the bridge's read handler in 1 MiB pieces, and reports the
+// per-read latency distribution, the throughput, and where the CPU went
+// (a pprof profile written next to the test binary's temp dir).
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime/pprof"
+	"sort"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	_ "github.com/rclone/rclone/backend/sftp"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/config/configfile"
+)
+
+func TestMeasureNASRead(t *testing.T) {
+	spec := os.Getenv("ES_VFSBRIDGE_NAS")
+	if spec == "" {
+		t.Skip("set ES_VFSBRIDGE_NAS=host=...,port=...,user=...,key_file=... to run the NAS read measurement")
+	}
+	relPath := os.Getenv("ES_VFSBRIDGE_NAS_PATH")
+	if relPath == "" {
+		t.Fatal("set ES_VFSBRIDGE_NAS_PATH to a file path relative to the SFTP root")
+	}
+	mib := int64(256)
+	if v := os.Getenv("ES_VFSBRIDGE_NAS_MIB"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mib = n
+	}
+	readSize := int64(fs.Mebi)
+	if v := os.Getenv("ES_VFSBRIDGE_NAS_READ"); v != "" {
+		var ss fs.SizeSuffix
+		if err := ss.Set(v); err != nil {
+			t.Fatal(err)
+		}
+		readSize = int64(ss)
+	}
+	if os.Getenv("ES_VFSBRIDGE_MEASURE_DEBUG") != "" {
+		fs.GetConfig(context.Background()).LogLevel = fs.LogLevelDebug
+	}
+
+	tmp := t.TempDir()
+	confPath := filepath.Join(tmp, "rclone.conf")
+	var conf strings.Builder
+	conf.WriteString("[nas]\ntype = sftp\nknown_hosts_file = none\nshell_type = unix\n")
+	for _, kv := range strings.Split(spec, ",") {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			t.Fatalf("bad ES_VFSBRIDGE_NAS entry %q", kv)
+		}
+		fmt.Fprintf(&conf, "%s = %s\n", strings.TrimSpace(k), strings.TrimSpace(v))
+	}
+	for _, extra := range strings.Split(os.Getenv("ES_VFSBRIDGE_NAS_EXTRA"), ";") {
+		if extra = strings.TrimSpace(extra); extra != "" {
+			conf.WriteString(extra + "\n")
+		}
+	}
+	if err := os.WriteFile(confPath, []byte(conf.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.SetConfigPath(confPath)
+	configfile.Install()
+	useTempCacheDir(t)
+
+	s := NewServer()
+	if err := s.AddRemote("nas"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Stop)
+
+	// Walk to the file.
+	dir := remoteRootID(t, s, "nas")
+	parts := strings.Split(relPath, "/")
+	for _, p := range parts[:len(parts)-1] {
+		dir = childID(t, s, dir, p)
+	}
+	fileID := childID(t, s, dir, parts[len(parts)-1])
+
+	mustOK(t, s.handleRequest(req(t, 1, "open", map[string]any{"itemId": fileID, "write": false})), "open")
+
+	profPath := filepath.Join(tmp, "nas-read.prof")
+	if os.Getenv("ES_VFSBRIDGE_NAS_PPROF") != "" {
+		profPath = os.Getenv("ES_VFSBRIDGE_NAS_PPROF")
+	}
+	pf, err := os.Create(profPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pprof.StartCPUProfile(pf); err != nil {
+		t.Fatal(err)
+	}
+
+	total := mib * int64(fs.Mebi)
+	var lat []time.Duration
+	t0 := time.Now()
+	var off int64
+	for off < total {
+		r0 := time.Now()
+		r := mustOK(t, s.handleRequest(req(t, 2, "read", map[string]any{"itemId": fileID, "offset": off, "length": readSize})), "read")
+		lat = append(lat, time.Since(r0))
+		n := len(r.Result.([]byte))
+		if n == 0 {
+			t.Fatalf("short read at %d", off)
+		}
+		off += int64(n)
+	}
+	elapsed := time.Since(t0)
+	pprof.StopCPUProfile()
+	pf.Close()
+	mustOK(t, s.handleRequest(req(t, 3, "close", map[string]any{"itemId": fileID})), "close")
+
+	sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })
+	pct := func(p float64) time.Duration { return lat[int(float64(len(lat)-1)*p)] }
+	t.Logf("bridge sequential read of %d MiB in %s pieces: %v = %.1f MB/s; %d reads, latency p50 %v p90 %v p99 %v max %v; profile %s",
+		mib, fs.SizeSuffix(readSize), elapsed.Round(time.Millisecond), float64(total)/elapsed.Seconds()/1e6,
+		len(lat), pct(0.5).Round(time.Millisecond), pct(0.9).Round(time.Millisecond), pct(0.99).Round(time.Millisecond), lat[len(lat)-1].Round(time.Millisecond), profPath)
+}
