@@ -1783,7 +1783,17 @@ func (o *Object) updateSimple(ctx context.Context, body io.Reader, getBody func(
 		// The server may still be dealing with it for a moment. A sleep isn't ideal but I
 		// haven't been able to think of a better method to find out if the server has
 		// finished - ncw
-		time.Sleep(1 * time.Second)
+		//
+		// Enter Space fork: not when the CALLER cancelled. The VFS cancels an
+		// upload in progress whenever the file is written to again, and waits
+		// for it to finish before the write proceeds, so this sleep sat on the
+		// write path: creating a file queues an upload of it empty, and the
+		// first write into it then waited a full second for this. Measured on
+		// a loopback server: 1.01s for the first write of every new file.
+		select {
+		case <-ctx.Done():
+		case <-time.After(1 * time.Second):
+		}
 		// Remove failed upload
 		_ = o.Remove(ctx)
 		return err
