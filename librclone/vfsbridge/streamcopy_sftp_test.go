@@ -13,9 +13,11 @@ import (
 	"github.com/rclone/rclone/fs/rc"
 )
 
-// The harness's sequential-copy case, against an sftp server configured as the
-// harness configures the stock one (cache mode writes, no write-back delay).
-func TestReproSequentialCopyOverSFTPWritesCache(t *testing.T) {
+// The harness's sequential-copy case at bridge level, against an sftp server
+// configured as the harness configures the stock one (cache mode writes, no
+// write-back delay): plain, with the size set first, with a second open for
+// writing mid-copy, and both. Each copy must land whole on the server.
+func TestSequentialCopyOverSFTPInHarnessConfiguration(t *testing.T) {
 	served := t.TempDir()
 	call := rc.Calls.Get("serve/start")
 	out, err := call.Fn(t.Context(), rc.Params{
