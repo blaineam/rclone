@@ -278,4 +278,14 @@ func TestOpenRangeWriterRefusals(t *testing.T) {
 	_, err = f.OpenRangeWriter(ctx, "doc.bin")
 	assert.ErrorIs(t, err, fs.ErrorPermissionDenied)
 	assert.Equal(t, "0123456789", m.contentOf(1), "untouched")
+	opens := m.count("file_open")
+
+	// The denial is remembered: the next open is refused without asking
+	// pCloud again, even once pCloud would allow it.
+	m.mu.Lock()
+	m.denyOpen = false
+	m.mu.Unlock()
+	_, err = f.OpenRangeWriter(ctx, "doc.bin")
+	assert.ErrorIs(t, err, fs.ErrorPermissionDenied)
+	assert.Equal(t, opens, m.count("file_open"), "no further file_open after a 2003")
 }

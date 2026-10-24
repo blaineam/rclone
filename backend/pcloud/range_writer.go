@@ -17,6 +17,15 @@ import (
 
 // OpenRangeWriter opens an existing file for writes at arbitrary offsets.
 //
+// Whether pCloud lets an app use its file API is up to pCloud: for rclone's
+// own OAuth app it answers file_open on an existing file with 2003 "Access
+// denied" (verified against a live account on 2026-10-23), the same answer
+// that had the upstream OpenWriterAt disabled. On that answer the Fs
+// remembers the denial and every later open is refused at once with
+// ErrorPermissionDenied, so the VFS falls back to replacing the file
+// whole, as it did before this feature existed. An app pCloud does allow
+// gets the edit below.
+//
 // pCloud's file API edits the stored file in place: file_open on the
 // fileid gives a descriptor, file_pwrite writes at an offset (a write past
 // the end extends the file), file_truncate sets its size and file_close
@@ -38,6 +47,9 @@ func (f *Fs) OpenRangeWriter(ctx context.Context, remote string) (fs.RangeWriter
 		return nil, err
 	}
 	o := obj.(*Object)
+	if f.fileAPIDenied.Load() {
+		return nil, fmt.Errorf("OpenRangeWriter: pCloud denies the file API to this app (error 2003 on an earlier open): %w", fs.ErrorPermissionDenied)
+	}
 	fileID, err := strconv.ParseInt(fileIDtoNumber(o.id), 10, 64)
 	if err != nil {
 		return nil, fmt.Errorf("OpenRangeWriter: file id %q: %w", o.id, err)
@@ -46,9 +58,14 @@ func (f *Fs) OpenRangeWriter(ctx context.Context, remote string) (fs.RangeWriter
 	if err := w.reopen(); err != nil {
 		if apiErr, ok := errorOf(err); ok && apiErr.Result == 2003 {
 			// "Access denied": pCloud does not let this app use the file
-			// API. Say so as a permission error, which the VFS turns into
-			// the EPERM an open for an in-place edit gets on a backend
-			// without the feature.
+			// API (it answered so for rclone's own OAuth app on an existing
+			// file by id, 2026-10-23). Remember that for the life of the Fs
+			// so later opens cost no round trip, say it once, and report a
+			// permission error, which the VFS turns into the EPERM an open
+			// for an in-place edit gets on a backend without the feature.
+			if !f.fileAPIDenied.Swap(true) {
+				fs.Logf(f, "pCloud denies its file API to this app (%v): files here are replaced whole, not edited in place", apiErr)
+			}
 			return nil, fmt.Errorf("OpenRangeWriter: pCloud refused to open the file for writing (%v): %w", apiErr, fs.ErrorPermissionDenied)
 		}
 		return nil, err

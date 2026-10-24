@@ -15,7 +15,7 @@ import (
 // It is what an open for writing WITHOUT O_TRUNC of a file that already has
 // content gets with --vfs-cache-mode off and --vfs-range-writes, on a backend
 // whose storage can write at an offset (fs.Features.OpenRangeWriter: local,
-// sftp, smb, azurefiles, pcloud, hidrive). The alternatives both lose: WriteFileHandle is a sequential upload
+// sftp, smb, azurefiles, hidrive). The alternatives both lose: WriteFileHandle is a sequential upload
 // from byte zero and refuses such an open (EPERM), and the cache modes
 // download the whole file to patch a few bytes of it and upload the whole
 // file on close. Here a write at an offset is one positioned write on the

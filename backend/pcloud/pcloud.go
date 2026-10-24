@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/rclone/rclone/backend/pcloud/api"
@@ -178,17 +179,18 @@ type Options struct {
 
 // Fs represents a remote pcloud
 type Fs struct {
-	name         string                 // name of this remote
-	root         string                 // the path we are working on
-	opt          Options                // parsed options
-	features     *fs.Features           // optional features
-	ts           *oauthutil.TokenSource // the token source, used to create new clients
-	srv          *rest.Client           // the connection to the server
-	cleanupSrv   *rest.Client           // the connection used for the cleanup method
-	dirCache     *dircache.DirCache     // Map of directory path to directory id
-	pacer        *fs.Pacer              // pacer for API calls
-	tokenRenewer *oauthutil.Renew       // renew the token on expiry
-	lastDiffID   int64                  // change tracking state for diff long-polling
+	name          string                 // name of this remote
+	root          string                 // the path we are working on
+	opt           Options                // parsed options
+	features      *fs.Features           // optional features
+	ts            *oauthutil.TokenSource // the token source, used to create new clients
+	srv           *rest.Client           // the connection to the server
+	cleanupSrv    *rest.Client           // the connection used for the cleanup method
+	dirCache      *dircache.DirCache     // Map of directory path to directory id
+	pacer         *fs.Pacer              // pacer for API calls
+	tokenRenewer  *oauthutil.Renew       // renew the token on expiry
+	lastDiffID    int64                  // change tracking state for diff long-polling
+	fileAPIDenied *atomic.Bool           // pCloud answered file_open with 2003: the file API is closed to this app; a pointer because NewFs copies the Fs
 }
 
 // Object describes a pcloud object
@@ -337,12 +339,13 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	canCleanup := opt.Username != "" && opt.Password != ""
 	f := &Fs{
-		name:  name,
-		root:  root,
-		opt:   *opt,
-		ts:    ts,
-		srv:   rest.NewClient(oAuthClient).SetRoot("https://" + opt.Hostname),
-		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		name:          name,
+		root:          root,
+		opt:           *opt,
+		ts:            ts,
+		fileAPIDenied: new(atomic.Bool),
+		srv:           rest.NewClient(oAuthClient).SetRoot("https://" + opt.Hostname),
+		pacer:         fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	if canCleanup {
 		f.cleanupSrv = rest.NewClient(fshttp.NewClient(ctx)).SetRoot("https://" + opt.Hostname)
