@@ -237,12 +237,11 @@ open for writing that does not truncate it (an in-place edit) fails with
 EPERM.
 
 The `--vfs-range-writes` flag lets such an open succeed on backends whose
-storage can write at an offset (the `OpenRangeWriter` feature: `local`,
-`sftp`, `smb`, `azurefiles`, `memory`, and `alias`, `combine`, `hasher` and
-`archive` over one of those). Each write then goes to the backend as a positioned write of
-exactly the bytes written, a write past the end extends the file, truncate
-sets its size, and `fsync` returns once the backend has the bytes on
-stable storage where it can promise that (SFTP servers with the
+storage can write at an offset (the `OpenRangeWriter` feature; the table
+below says which). Each write then goes to the backend as a positioned
+write of exactly the bytes written, a write past the end extends the file,
+truncate sets its size, and `fsync` returns once the backend has the bytes
+on stable storage where it can promise that (SFTP servers with the
 `fsync@openssh.com` extension). Patching a few bytes of metadata into a
 multi-GB file costs those bytes, not the file. Reads of a file open this
 way go to the backend and see the bytes written so far. Only a file that
@@ -251,11 +250,37 @@ being copied in, between its creation and its first write) streams as
 before, and a second open for writing while that stream is in flight gets
 the handle it always got.
 
-Backends that cannot write at an offset (object stores, `ftp`, `webdav`,
-`hdfs`, and the `crypt`, `compress`, `chunker` and `union` wrappers, where a
-byte patch would break the stored form or has no single home) still refuse
-the open with EPERM, and the log says which backend refused. Cache modes other than `off` are unaffected: they edit
-the cached copy and upload the whole file on close as before.
+Backends that cannot write at an offset still refuse the open with EPERM,
+and the log says which backend refused. Cache modes other than `off` are
+unaffected: they edit the cached copy and upload the whole file on close as
+before.
+
+Which backends edit in place, and why the others do not:
+
+| Backend | In-place edits | Primitive, or why not |
+|---|---|---|
+| `local` | yes | `pwrite(2)`, `ftruncate`, `fsync` |
+| `sftp` | yes | `SSH_FXP_WRITE` carries an offset; `FSETSTAT` sets the size; `fsync@openssh.com` where the server offers it |
+| `smb` | yes | SMB2 WRITE at an offset, SET_INFO end-of-file, SMB2 FLUSH |
+| `azurefiles` | yes | `Put Range` writes a byte range, `Resize` sets the length; each range is durable on return |
+| `pcloud` | yes | the file API: `file_open` on the file id, `file_pwrite` at an offset, `file_truncate`, `file_close`; one descriptor per edit, bound to its connection and reopened if that drops |
+| `hidrive` | yes | `PATCH /file` with an `offset` replaces only the bytes it carries; `POST /file/truncate` sets the size |
+| `memory` | yes | the object is a byte slice |
+| `alias` | pass-through | it is the remote it points at |
+| `combine` | pass-through | maps the path to one upstream; off when any upstream cannot |
+| `union` | pass-through | to the one upstream holding the file, when the action policy would write there; a file mirrored on several upstreams or on a read-only one is refused (EPERM) rather than left to diverge; off when any upstream cannot |
+| `hasher` | pass-through | bytes untouched; stored hashes pruned on open and on close |
+| `archive` | pass-through | files outside archives; a file inside an archive is a read-only view |
+| `crypt` | no | a byte patch inside the cipher stream corrupts every block from there on |
+| `compress` | no | a byte patch inside a gzip stream corrupts it |
+| `chunker` | no | the file is split into parts behind a metadata object |
+| `cache` | no | deprecated wrapper with its own chunk store |
+| `ftp` | no | `REST` before `STOR` writes from an offset on some servers, but nothing in FTP shortens a file and no server advertises how it treats the bytes after the write |
+| `webdav` | no | the protocol has no partial write; SabreDAV's `PATCH` partial-update extension is rarely enabled (Nextcloud and ownCloud do not) and has no truncate |
+| `hdfs` | no | append-only |
+| `seafile`, `netstorage`, `opendrive`, `filefabric`, `quatrix`, `filescom` | no | whole-file (or chunked whole-file) upload APIs; a chunk lands in a new version, never in the stored file |
+| object stores (`s3`, `b2`, `googlecloudstorage`, `azureblob`, `swift`, `oracleobjectstorage`, `qingstor`, `storj`, `sia`) and the drive-style APIs (`drive`, `dropbox`, `onedrive`, `box`, `mega`, `jottacloud`, `protondrive`, `koofr`, `yandex`, `zoho`, `putio`, `pikpak`, `sharefile`, `sugarsync`, `premiumizeme`, `fichier`, `uptobox`, `ulozto`, `linkbox`, `gofile`, `pixeldrain`, `internetarchive`, `imagekit`, `cloudinary`, `iclouddrive`, `huaweidrive`, `mailru`, `filen`, `drime`, `internxt`, `shade`, `doi`, `filelu`, `googlephotos`) | no | objects are immutable; a change is a new object, so a one-byte edit would be a download, a patch and a whole re-upload, which the VFS does not hide inside the backend |
+| `http` | no | read-only |
 
 ### VFS Chunked Reading
 

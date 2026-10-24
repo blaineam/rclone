@@ -194,9 +194,11 @@ type Features struct {
 	// OpenRangeWriter opens an EXISTING object for writes at arbitrary
 	// offsets, without truncating it: an in-place edit costs the bytes
 	// written, not the object. Returns ErrorObjectNotFound when there is
-	// no such object. Backends whose storage can seek on write (sftp,
-	// local) implement it; wrapping backends that transform the byte
-	// stream (crypt, compress, chunker) must not pass it through.
+	// no such object. Backends whose storage can seek on write (local,
+	// sftp, smb, azurefiles, pcloud, hidrive, memory) implement it;
+	// wrappers that leave bytes alone (alias, combine, hasher, archive,
+	// union) pass it through; wrapping backends that transform the byte
+	// stream (crypt, compress, chunker) must not.
 	OpenRangeWriter func(ctx context.Context, remote string) (RangeWriter, error)
 
 	// UserInfo returns info about the connected user

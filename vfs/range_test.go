@@ -2,6 +2,7 @@ package vfs
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"testing"
@@ -110,6 +111,37 @@ type noRangeFs struct{ fs.Fs }
 func (f noRangeFs) Features() *fs.Features {
 	ft := *f.Fs.Features()
 	ft.OpenRangeWriter = nil
+	return &ft
+}
+
+// A backend with the feature can still refuse one file (a union holding it
+// on several upstreams, a pCloud that refuses its file API): that open is
+// EPERM too, and the file is untouched.
+func TestRangeFileHandleBackendRefusesTheFile(t *testing.T) {
+	r, _ := newTestVFS(t)
+	if r.Fremote.Features().OpenRangeWriter == nil {
+		t.Skipf("%v cannot write at an offset", r.Fremote)
+	}
+	opt := vfscommon.Opt
+	opt.CacheMode = vfscommon.CacheModeOff
+	opt.RangeWrites = true
+	vfs := NewUnshared(context.Background(), refusingRangeFs{r.Fremote}, &opt)
+	t.Cleanup(func() { cleanupVFS(t, vfs) })
+	r.WriteObject(context.Background(), "dir/file1", "file1 contents", t1)
+
+	_, err := vfs.OpenFile("dir/file1", os.O_RDWR, 0o666)
+	assert.Equal(t, EPERM, err)
+	assert.Equal(t, "file1 contents", remoteContents(t, r, "dir/file1"))
+}
+
+// refusingRangeFs has the feature and refuses every file with it.
+type refusingRangeFs struct{ fs.Fs }
+
+func (f refusingRangeFs) Features() *fs.Features {
+	ft := *f.Fs.Features()
+	ft.OpenRangeWriter = func(ctx context.Context, remote string) (fs.RangeWriter, error) {
+		return nil, fmt.Errorf("%q has no single home: %w", remote, fs.ErrorPermissionDenied)
+	}
 	return &ft
 }
 

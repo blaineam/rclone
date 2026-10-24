@@ -1,9 +1,10 @@
 package vfsbridge
 
 // Which remotes can edit a file in place: every backend whose storage writes
-// at an offset, through the wrappers that pass bytes through untouched, and
-// not through the wrappers whose stored form a byte patch would break. All on
-// top of a local directory, so this runs anywhere.
+// at an offset, through the wrappers that pass bytes through untouched (a
+// union forwards to the one upstream holding the file), and not through the
+// wrappers whose stored form a byte patch would break. All on top of a local
+// directory, so this runs anywhere.
 
 import (
 	"crypto/rand"
@@ -63,7 +64,7 @@ func TestInPlaceEditsThroughWrappers(t *testing.T) {
 		{"w_combine", true, "a combine maps paths to an upstream and passes bytes through"},
 		{"w_hasher", true, "a hasher passes bytes through and drops the stale hashes"},
 		{"w_archive", true, "an archive passes files outside archives through"},
-		{"w_union", false, "a union may hold the file on several upstreams"},
+		{"w_union", true, "a union forwards to the one upstream that holds the file"},
 		{"w_chunker", false, "a chunker splits the file into parts"},
 		{"w_compress", false, "a byte patch inside a compressed stream corrupts it"},
 		{"w_crypt", false, "a byte patch inside a cipher stream corrupts it"},

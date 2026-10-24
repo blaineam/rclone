@@ -3,6 +3,7 @@ package alias
 import (
 	"context"
 	"fmt"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -106,4 +107,26 @@ func TestNewFSInvalidRemote(t *testing.T) {
 
 	require.Error(t, err)
 	require.Nil(t, f)
+}
+
+// An alias is the remote it points at, features included: a file behind an
+// alias of a local directory is edited in place.
+func TestOpenRangeWriterPassesThrough(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "doc.bin"), []byte("0123456789"), 0o644))
+	prepare(t, root)
+	ctx := context.Background()
+	f, err := fs.NewFs(ctx, remoteName+":")
+	require.NoError(t, err)
+	do := f.Features().OpenRangeWriter
+	require.NotNil(t, do, "the alias passes the wrapped remote's feature through")
+	w, err := do(ctx, "doc.bin")
+	require.NoError(t, err)
+	_, err = w.WriteAt([]byte("XY"), 3)
+	require.NoError(t, err)
+	require.NoError(t, w.Truncate(6))
+	require.NoError(t, w.Close())
+	got, err := os.ReadFile(filepath.Join(root, "doc.bin"))
+	require.NoError(t, err)
+	require.Equal(t, "012XY5", string(got))
 }

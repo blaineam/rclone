@@ -14,8 +14,8 @@ import (
 //
 // It is what an open for writing WITHOUT O_TRUNC of a file that already has
 // content gets with --vfs-cache-mode off and --vfs-range-writes, on a backend
-// whose storage can write at an offset (fs.Features.OpenRangeWriter: sftp,
-// local). The alternatives both lose: WriteFileHandle is a sequential upload
+// whose storage can write at an offset (fs.Features.OpenRangeWriter: local,
+// sftp, smb, azurefiles, pcloud, hidrive). The alternatives both lose: WriteFileHandle is a sequential upload
 // from byte zero and refuses such an open (EPERM), and the cache modes
 // download the whole file to patch a few bytes of it and upload the whole
 // file on close. Here a write at an offset is one positioned write on the
@@ -60,6 +60,14 @@ func (f *File) openRange() (*RangeFileHandle, error) {
 	}
 	w, err := do(f.ctx, f.Path())
 	if err != nil {
+		if errors.Is(err, fs.ErrorPermissionDenied) {
+			// The backend has the feature but not for this file: a union
+			// holding it on several upstreams, a pCloud that refuses its
+			// file API. The same EPERM as a backend without the feature,
+			// with the backend's reason in the log.
+			fs.Errorf(f.Path(), "can't edit a file in place: %v", err)
+			return nil, EPERM
+		}
 		fs.Errorf(f.Path(), "RangeFileHandle: open failed: %v", err)
 		return nil, err
 	}
