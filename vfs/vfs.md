@@ -263,7 +263,7 @@ Which backends edit in place, and why the others do not:
 | `sftp` | yes | `SSH_FXP_WRITE` carries an offset; `FSETSTAT` sets the size; `fsync@openssh.com` where the server offers it |
 | `smb` | yes | SMB2 WRITE at an offset, SET_INFO end-of-file, SMB2 FLUSH |
 | `azurefiles` | yes | `Put Range` writes a byte range, `Resize` sets the length; each range is durable on return |
-| `pcloud` | implemented, but pCloud denies it | the file API (`file_open` on the file id, `file_pwrite` at an offset, `file_truncate`, `file_close`) edits in place, but pCloud answers `file_open` with 2003 "Access denied" for rclone's OAuth app (verified live 2026-10-23); the backend then remembers the denial and refuses every open at once (EPERM), so in practice files are replaced whole. An app pCloud allows gets the edit. |
+| `pcloud` | implemented, but pCloud denies it | the file API (`file_open` on the file id, `file_pwrite` at an offset, `file_truncate`, `file_close`) edits in place, but pCloud answers `file_open` with 2003 "Access denied" for rclone's OAuth app (verified live 2026-10-23); the backend then remembers the denial and refuses every open at once (EPERM), so in practice files are replaced whole through this backend. An app pCloud allows gets the edit. **pCloud over SFTP works instead:** an `sftp` remote on `sftp.pcloud.com` (EU: `esftp.pcloud.com`, port 22, pCloud email and password) edits in place; verified live 2026-10-23 (patch 44 ms, 256 KiB append 45 ms, truncate 44 ms, read-back byte for byte). |
 | `hidrive` | yes | `PATCH /file` with an `offset` replaces only the bytes it carries; `POST /file/truncate` sets the size |
 | `memory` | yes | the object is a byte slice |
 | `alias` | pass-through | it is the remote it points at |
