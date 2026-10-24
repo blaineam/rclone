@@ -1524,8 +1524,18 @@ func (s *Server) doClose(req *Request) *Response {
 	if err := json.Unmarshal(req.Args, &args); err != nil {
 		return errorResp(req.ID, cEINVAL)
 	}
-	handle, wasWrite := s.handles.PopLast(args.ItemID)
+	handle, wasWrite, idleDuplicate := s.handles.PopForClose(args.ItemID)
 	if handle == nil {
+		return okResp(req.ID, nil)
+	}
+	if w, ok := handle.(*vfs.WriteFileHandle); ok && idleDuplicate {
+		// A second write handle the kernel opened and is dropping while the
+		// copy keeps streaming through the other one. Closing it normally
+		// would start an empty upload of the same path under the stream.
+		if err := w.Discard(); err != nil {
+			fs.Errorf(nil, "VFS bridge: discarding an idle duplicate write handle of item %d: %v", args.ItemID, err)
+			return errorResp(req.ID, mapVFSErr(err))
+		}
 		return okResp(req.ID, nil)
 	}
 	// Look the file up BEFORE closing: after the last close a reclaim can drop it, and
@@ -1666,7 +1676,7 @@ func (s *Server) doWrite(req *Request) *Response {
 	// writing, taking whichever handle was stored last could send the write to
 	// the read handle and fail — or worse, appear to succeed against the wrong
 	// one. See `HandleTable`.
-	handle := s.handles.GetForWrite(args.ItemID)
+	handle := s.handles.GetForWrite(args.ItemID, args.Offset, len(args.Data))
 	if handle == nil {
 		return errorResp(req.ID, cENOENT)
 	}

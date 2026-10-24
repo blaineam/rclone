@@ -326,6 +326,29 @@ func (fh *WriteFileHandle) Flush() error {
 //
 // It isn't called directly from userspace so the error is ignored by
 // the kernel
+// Discard closes a handle that has never written anything WITHOUT touching
+// the remote: no empty upload, no truncation, whatever flags it was opened
+// with. For a caller that holds several write handles on one file and is
+// dropping one that carried no data while another still streams the file
+// (the FSKit bridge, which gets no handle identity from the kernel). A handle
+// that has already written must be closed properly; Discard refuses it with
+// EBADF.
+func (fh *WriteFileHandle) Discard() error {
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	if fh.closed {
+		return ECLOSED
+	}
+	if fh.opened {
+		return EBADF
+	}
+	fh.closed = true
+	fh.cancel()
+	fh.file.delWriter(fh)
+	return nil
+}
+
+// Release is called when we are finished with the file handle
 func (fh *WriteFileHandle) Release() error {
 	fh.mu.Lock()
 	defer fh.mu.Unlock()

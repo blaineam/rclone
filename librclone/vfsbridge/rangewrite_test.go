@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -454,4 +455,50 @@ func TestStreamingCopyStillStreamsWithRangeWrites(t *testing.T) {
 			t.Fatalf("preallocated copy on the remote: %d bytes, err %v (setattr ok=%v errno=%d)", len(got), err, resp.Ok, resp.Error)
 		}
 	})
+}
+
+// What the harness log showed on 2026-10-23: the kernel opened a new file for
+// writing TWICE before its first write (the second open right after the module
+// refused a time attribute), the copy's bytes went to the newest handle, and
+// the close of the other descriptor -- which had written nothing -- popped
+// that newest handle, finishing the stream at 2 MiB; the next write reached
+// the idle first stream at the wrong offset and failed EIO. The bridge has no
+// handle identity from FSKit, so it must keep the handle that carries data
+// and release an idle one on a close, whichever was opened first.
+func TestSecondOpenBeforeDataDoesNotStealTheStream(t *testing.T) {
+	s, backingA := streamingServer(t)
+	dir := remoteRootID(t, s, "rem_a")
+	part := payloadOf(1<<20, 'q')
+
+	for _, tc := range []struct {
+		name       string
+		closeAfter int // after how many writes the duplicate's close arrives
+	}{
+		{"duplicate closed mid-copy", 2},
+		{"duplicate closed before any write", 0},
+		{"duplicate closed at the end", 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name := strings.ReplaceAll(tc.name, " ", "-") + ".bin"
+			r := mustOK(t, s.handleRequest(req(t, 1, "create", map[string]any{"dirId": dir, "name": name, "isDir": false})), "create")
+			id := r.Result.(ItemInfo).ID
+			mustOK(t, s.handleRequest(req(t, 2, "open", map[string]any{"itemId": id, "write": true})), "first open")
+			mustOK(t, s.handleRequest(req(t, 3, "open", map[string]any{"itemId": id, "write": true})), "second open, before any data")
+			closed := false
+			for i := 0; i <= 4; i++ {
+				if i == tc.closeAfter && !closed {
+					mustOK(t, s.handleRequest(req(t, 4, "close", map[string]any{"itemId": id})), "close of the duplicate")
+					closed = true
+				}
+				if i < 4 {
+					mustOK(t, s.handleRequest(req(t, 5, "write", map[string]any{"itemId": id, "offset": i * len(part), "data": part})), fmt.Sprintf("write %d", i))
+				}
+			}
+			mustOK(t, s.handleRequest(req(t, 6, "close", map[string]any{"itemId": id})), "final close")
+			got, err := os.ReadFile(filepath.Join(backingA, name))
+			if err != nil || !bytes.Equal(got, bytes.Repeat(part, 4)) {
+				t.Fatalf("on the remote: %d bytes, err %v, want the whole 4 MiB", len(got), err)
+			}
+		})
+	}
 }
