@@ -1,35 +1,80 @@
 # Enter Space fork coverage include list — GENERATED, do not edit.
 # Regenerate after every upstream merge: bin/es-fork-coverage.sh --regen
-# base v1.75.2 be8d6044eacb843b74d335db0c5fbe09222031fe
-# head f0afdbcd7bf4735f3907459868e87a4ee6950940
+# base v1.76.0 e982ff36668f5130d94b4f70409babb3d964df42
+# head 2ac13d3b2799fe57795738d101b524823e00a75c
 # <file> <from>-<to> <func> | <file> * (fork-added, whole file)
+backend/archive/archive.go 656-665 (*Fs).OpenRangeWriter
+backend/azurefiles/azurefiles.go 1000-1010 (*Fs).OpenRangeWriter
+backend/azurefiles/azurefiles.go 1020-1028 (*rangeWriter).Truncate
+backend/azurefiles/azurefiles.go 1031-1031 (*rangeWriter).Sync
+backend/azurefiles/azurefiles.go 1034-1036 (*rangeWriter).Close
+backend/combine/combine.go 1063-1073 (*Fs).OpenRangeWriter
 backend/crypt/cipher.go 232-256 (*Cipher).Key
 backend/drime/drime.go 290-315 (*Fs).readMetaDataForPath
-backend/drime/drime.go 461-473 (*Fs).FindLeaf
-backend/dropbox/dropbox.go 1464-1561 (*Fs).PublicLink
+backend/drime/drime.go 464-476 (*Fs).FindLeaf
+backend/dropbox/dropbox.go 1465-1562 (*Fs).PublicLink
+backend/hasher/hasher.go 310-323 (*Fs).OpenRangeWriter
+backend/hasher/hasher.go 333-339 (*rangeWriter).Close
+backend/hidrive/range_writer.go *
 backend/iclouddrive/iclouddrive.go 104-120 (*Fs).findLeafItem
-backend/internxt/internxt.go 520-541 (*Fs).FindLeaf
-backend/internxt/internxt.go 677-685 normVariants
-backend/internxt/internxt.go 695-706 (*Fs).findFile
-backend/internxt/internxt.go 709-764 (*Fs).findFileOne
+backend/internxt/internxt.go 518-539 (*Fs).FindLeaf
+backend/internxt/internxt.go 675-683 normVariants
+backend/internxt/internxt.go 693-704 (*Fs).findFile
+backend/internxt/internxt.go 707-762 (*Fs).findFileOne
 backend/local/icloud_darwin.go *
 # skipped backend/local/icloud_other.go: build constraints exclude this host
-backend/local/local.go 1453-1543 (*Object).Open
-backend/sftp/sftp.go 2613-2619 statusCodeOf
-backend/sftp/sftp.go 2621-2678 (*Fs).stat
+backend/local/local.go 1521-1611 (*Object).Open
+backend/local/local.go 1986-2000 (*Fs).OpenRangeWriter
+backend/local/local.go 2010-2010 (*rangeWriter).WriteAt
+backend/local/local.go 2013-2013 (*rangeWriter).ReadAt
+backend/local/local.go 2016-2016 (*rangeWriter).Truncate
+backend/local/local.go 2019-2019 (*rangeWriter).Sync
+backend/local/local.go 2022-2028 (*rangeWriter).Close
+backend/memory/memory.go 680-689 (*Fs).OpenRangeWriter
+backend/memory/memory.go 698-713 (*rangeWriter).edit
+backend/memory/memory.go 716-728 (*rangeWriter).WriteAt
+backend/memory/memory.go 731-743 (*rangeWriter).ReadAt
+backend/memory/memory.go 746-757 (*rangeWriter).Truncate
+backend/memory/memory.go 760-760 (*rangeWriter).Sync
+backend/memory/memory.go 763-763 (*rangeWriter).Close
+backend/pcloud/pcloud.go 326-404 NewFs
+backend/pcloud/range_writer.go *
+backend/sftp/sftp.go 2420-2519 (*Object).Hash
+backend/sftp/sftp.go 2680-2686 statusCodeOf
+backend/sftp/sftp.go 2688-2745 (*Fs).stat
+backend/sftp/sftp.go 2980-3007 (*Fs).OpenRangeWriter
+backend/sftp/sftp.go 3028-3040 (*rangeWriter).WriteAt
+backend/sftp/sftp.go 3043-3063 (*rangeWriter).ReadAt
+backend/sftp/sftp.go 3066-3077 (*rangeWriter).Truncate
+backend/sftp/sftp.go 3082-3099 (*rangeWriter).Sync
+backend/sftp/sftp.go 3103-3129 (*rangeWriter).Close
+backend/sftp/sftp.go 3131-3135 (*rangeWriter).remember
+backend/sftp/sftp.go 3165-3168 isShellNoSuchFile
+backend/smb/smb.go 833-857 (*Fs).OpenRangeWriter
+backend/smb/smb.go 871-883 (*rangeWriter).WriteAt
+backend/smb/smb.go 886-897 (*rangeWriter).ReadAt
+backend/smb/smb.go 900-911 (*rangeWriter).Truncate
+backend/smb/smb.go 914-925 (*rangeWriter).Sync
+backend/smb/smb.go 929-951 (*rangeWriter).Close
+backend/smb/smb.go 953-957 (*rangeWriter).remember
+backend/union/range_writer.go *
+backend/webdav/webdav.go 1773-1818 (*Object).updateSimple
 cmd/serve/nfs/nfs.go 127-145 Run
 cmd/serve/nfs/portmapper.go *
 cmd/serve/nfs/server.go 34-62 NewServer
 cmd/serve/nfs/server.go 71-77 (*Server).Shutdown
 cmd/serve/webdav/webdav.go 269-346 newWebDAV
 cmd/serve/webdav/webdav.go 658-705 (Handle).DeadProps
-fs/accounting/stats.go 119-168 (*StatsInfo).RemoteStats
-fs/accounting/stats.go 723-752 (*StatsInfo).ResetCounters
-fs/accounting/stats.go 755-764 (*StatsInfo).ResetErrors
-fs/accounting/stats.go 774-800 (*StatsInfo).Error
+fs/accounting/stats.go 120-170 (*StatsInfo).RemoteStats
+fs/accounting/stats.go 736-766 (*StatsInfo).ResetCounters
+fs/accounting/stats.go 769-778 (*StatsInfo).ResetErrors
+fs/accounting/stats.go 788-814 (*StatsInfo).Error
+fs/features.go 305-384 (*Features).Fill
+fs/features.go 392-496 (*Features).Mask
 fs/list/sorter.go 140-184 (*Sorter).startExtSort
 fs/operations/lsjson.go 275-400 StatJSON
 fs/rc/internal.go 233-274 rcVersion
+# skipped fs/types.go: declarations only (no statements changed)
 # skipped fs/versionsuffix.go: declarations only (no statements changed)
 lib/dircache/dircache.go 101-103 normKey
 lib/dircache/dircache.go 113-115 NameEqual
@@ -40,26 +85,51 @@ lib/dircache/dircache.go 246-314 (*DirCache)._findDir
 lib/oauthutil/enterspace_mobile.go *
 lib/scryptcache/scrypt.go *
 # skipped librclone/gomobile/cpu_ios_stub.go: build constraints exclude this host
-librclone/gomobile/gomobile.go 30-32 Initialize
-librclone/gomobile/gomobile.go 36-38 Finalize
-librclone/gomobile/gomobile.go 55-61 RPC
-librclone/gomobile/gomobile.go 67-95 StartVFSBridge
-librclone/gomobile/gomobile.go 106-118 RemoveVFSBridgeRemote
-librclone/gomobile/gomobile.go 123-131 VFSBridgeGeneration
-librclone/gomobile/gomobile.go 138-152 VFSBridgeUploadStatus
-librclone/gomobile/gomobile.go 160-176 RescueVFSBridgePendingUploads
-librclone/gomobile/gomobile.go 184-193 SetVFSBridgeWriteThrough
-librclone/gomobile/gomobile.go 198-206 SetVFSBridgeConfirmUploads
-librclone/gomobile/gomobile.go 210-218 StopVFSBridge
+librclone/gomobile/gomobile.go 32-34 Initialize
+librclone/gomobile/gomobile.go 38-40 Finalize
+librclone/gomobile/gomobile.go 57-63 RPC
+librclone/gomobile/gomobile.go 69-100 StartVFSBridge
+librclone/gomobile/gomobile.go 111-123 RemoveVFSBridgeRemote
+librclone/gomobile/gomobile.go 134-146 RefreshVFSBridgeRemote
+librclone/gomobile/gomobile.go 151-159 VFSBridgeGeneration
+librclone/gomobile/gomobile.go 166-180 VFSBridgeUploadStatus
+librclone/gomobile/gomobile.go 188-204 RescueVFSBridgePendingUploads
+librclone/gomobile/gomobile.go 212-221 SetVFSBridgeWriteThrough
+librclone/gomobile/gomobile.go 229-238 SetVFSBridgeInPlaceEdits
+librclone/gomobile/gomobile.go 243-251 SetVFSBridgeConfirmUploads
+librclone/gomobile/gomobile.go 255-263 StopVFSBridge
 librclone/vfsbridge/durability.go *
 librclone/vfsbridge/handles.go *
 librclone/vfsbridge/inode.go *
+librclone/vfsbridge/readahead.go *
 librclone/vfsbridge/server.go *
+vfs/dir.go 535-563 (*Dir)._readDir
+vfs/dir.go 568-580 (*Dir).refreshInBackground
+vfs/dir.go 584-657 (*Dir)._applyListing
 vfs/es_upload.go *
-vfs/vfs.go 516-522 (*VFS).PendingWriteback
-vfs/vfs.go 526-531 (*VFS).PendingUploads
-vfs/vfscache/cache.go 895-898 (*Cache).PendingUploads
+vfs/file.go 351-368 (*File).activeWriters
+vfs/file.go 844-954 (*File).Open
+vfs/range.go *
+vfs/read_write.go 40-42 (*RWFileHandle).SetReadAhead
+vfs/vfs.go 209-211 New
+vfs/vfs.go 219-221 NewUnshared
+vfs/vfs.go 223-305 newVFS
+vfs/vfs.go 533-539 (*VFS).PendingWriteback
+vfs/vfs.go 543-548 (*VFS).PendingUploads
+vfs/vfscache/cache.go 337-352 (*Cache).DirtyItem
+vfs/vfscache/cache.go 901-904 (*Cache).PendingUploads
+vfs/vfscache/downloaders/downloaders.go 116-147 New
+vfs/vfscache/downloaders/downloaders.go 297-392 (*Downloaders)._ensureDownloader
+vfs/vfscache/downloaders/downloaders.go 400-402 (*Downloaders).SetReadAhead
 vfs/vfscache/es_upload.go *
-vfs/vfscache/item.go 1473-1541 (*Item).WriteAtNoOverwrite
+vfs/vfscache/item.go 137-173 newItem
+vfs/vfscache/item.go 526-630 (*Item).open
+vfs/vfscache/item.go 1052-1182 (*Item).Reset
+vfs/vfscache/item.go 1248-1303 (*Item)._ensure
+vfs/vfscache/item.go 1309-1315 (*Item)._newDownloaders
+vfs/vfscache/item.go 1326-1334 (*Item).SetReadAhead
+vfs/vfscache/item.go 1510-1574 (*Item).WriteAtNoOverwrite
 vfs/vfscache/writeback/es_upload.go *
 vfs/vfscache/writeback/writeback.go 354-400 (*WriteBack).upload
+# skipped vfs/vfscommon/options.go: declarations only (no statements changed)
+vfs/write.go 336-349 (*WriteFileHandle).Discard
