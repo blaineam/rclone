@@ -103,7 +103,7 @@ func TestCancelPendingAuthUnblocksConfigSetup(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		code, err := configSetup(context.Background(), "id", "test", m, oauthConfig, nil)
+		code, _, err := configSetup(context.Background(), "id", "test", m, oauthConfig, nil)
 		done <- result{code, err}
 	}()
 

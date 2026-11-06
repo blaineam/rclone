@@ -1502,10 +1502,24 @@ func (item *Item) WriteAt(b []byte, off int64) (n int, err error) {
 //
 // This is used by the downloader to write bytes to the file.
 //
+// Bytes past the end of the item are not written; they are counted
+// as processed and skipped.
+//
 // It returns n the total bytes processed and skipped the number of
 // bytes which were processed but not actually written to the file.
 func (item *Item) WriteAtNoOverwrite(b []byte, off int64) (n int, skipped int, err error) {
 	item.mu.Lock()
+
+	// Don't write past the end of the item. If the file was shrunk
+	// with Truncate while the remote object is still longer, the
+	// downloader would otherwise grow the cache file back to the
+	// size of the remote object.
+	beyond := 0
+	if end := off + int64(len(b)); end > item.info.Size {
+		keep := max(item.info.Size-off, 0)
+		beyond = len(b) - int(keep)
+		b = b[:keep]
+	}
 
 	var (
 		// Range we wish to write
@@ -1515,25 +1529,6 @@ func (item *Item) WriteAtNoOverwrite(b []byte, off int64) (n int, skipped int, e
 		// Length of each write
 		nn int
 	)
-
-	// A dirty item's size is the size the user gave it, so the remote's
-	// bytes beyond it must never land in the cache file. Without this a
-	// file shrunk by Truncate before any of it was cached was silently
-	// re-extended: Truncate clips the present ranges to the new size,
-	// then the close's _ensure(0, size) starts a downloader whose reads
-	// run past that size, and WriteAtNoOverwrite wrote the old tail back
-	// beyond the truncation point -- which is what got uploaded.
-	//
-	// The bytes past the size are reported processed-but-skipped, so the
-	// downloader stops on its own as it would for already present data.
-	beyond := 0
-	if item.info.Dirty && item.info.Size >= 0 && off+int64(len(b)) > item.info.Size {
-		keep := max(item.info.Size-off, 0)
-		beyond = len(b) - int(keep)
-		b = b[:keep]
-		r.Size = keep
-		foundRanges = item.info.Rs.FindAll(r)
-	}
 
 	// Write the range out ignoring already written chunks
 	// fs.Debugf(item.name, "Ranges = %v", item.info.Rs)
@@ -1571,6 +1566,10 @@ func (item *Item) WriteAtNoOverwrite(b []byte, off int64) (n int, skipped int, e
 		skipped += beyond
 	}
 	item.mu.Unlock()
+	if err == nil {
+		n += beyond
+		skipped += beyond
+	}
 	return n, skipped, err
 }
 

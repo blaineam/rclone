@@ -54,7 +54,12 @@ func (w *rangeWriter) WriteAt(p []byte, off int64) (int, error) {
 	for written < len(p) {
 		n := min(len(p)-written, MaximumUploadBytes)
 		chunk := p[written : written+n]
-		err := w.o.fs.patchFile(w.ctx, w.path, bytes.NewReader(chunk), uint64(off)+uint64(written), time.Time{})
+		body, _, err := readerForChunk(bytes.NewReader(chunk), int64(n), false)
+		if err != nil {
+			return written, fmt.Errorf("OpenRangeWriter: buffering %d bytes at %d failed: %w", n, off+int64(written), err)
+		}
+		err = w.o.fs.patchFile(w.ctx, w.path, body, uint64(off)+uint64(written), time.Time{})
+		_ = body.Close()
 		if err != nil {
 			return written, fmt.Errorf("OpenRangeWriter: write of %d bytes at %d failed: %w", n, off+int64(written), err)
 		}

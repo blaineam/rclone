@@ -48,22 +48,23 @@ func (s *fakeInternxt) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(p, "/"), "/")
 	w.Header().Set("Content-Type", "application/json")
 	switch {
-	// /folders/content/{parent}/folders|files
-	case len(parts) == 4 && parts[0] == "folders" && parts[1] == "content" && r.Method == http.MethodGet:
+	// /folders/v2/content/{parent}/folders|files (cursor paged: one page,
+	// no nextCursor)
+	case len(parts) == 5 && parts[0] == "folders" && parts[1] == "v2" && parts[2] == "content" && r.Method == http.MethodGet:
 		if s.failList != 0 {
 			http.Error(w, `{"error":"boom"}`, s.failList)
 			return
 		}
-		if r.URL.Query().Get("offset") != "0" {
-			_, _ = w.Write([]byte(`{"folders":[],"files":[]}`))
+		parent := parts[3]
+		if parts[4] == "folders" {
+			folders := s.folders[parent]
+			if folders == nil {
+				folders = []map[string]any{}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"folders": folders})
 			return
 		}
-		parent := parts[2]
-		if parts[3] == "folders" {
-			_ = json.NewEncoder(w).Encode(map[string]any{"folders": s.folders[parent]})
-			return
-		}
-		var out []map[string]any
+		out := []map[string]any{}
 		for _, f := range s.files[parent] {
 			out = append(out, map[string]any{"uuid": f.UUID, "plainName": f.PlainName, "type": f.Type, "size": f.Size})
 		}
