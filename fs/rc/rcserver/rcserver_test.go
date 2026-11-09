@@ -1293,3 +1293,42 @@ func normalizeJSON(t *testing.T, jsonStr string) string {
 	require.NoError(t, err, "JSON marshalling failed")
 	return string(normalizedJSON)
 }
+
+// Range requests that follow closely reuse the served object instead of
+// looking it up again, and a request that fails drops it.
+func TestServeRemoteReusesObject(t *testing.T) {
+	opt := newTestOpt()
+	opt.Serve = true
+	opt.NoAuth = true // allow a bare local path
+	opt.Template.Path = defaultTestTemplate
+	rcServer, err := newServer(context.Background(), &opt, http.NewServeMux())
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	file := filepath.Join(dir, "movie.bin")
+	require.NoError(t, os.WriteFile(file, []byte("0123456789"), 0o600))
+
+	get := func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest("GET", "/movie.bin", nil)
+		r.Header.Set("Range", "bytes=2-5")
+		rcServer.serveRemote(w, r, "movie.bin", dir)
+		return w
+	}
+
+	w := get()
+	require.Equal(t, http.StatusPartialContent, w.Code)
+	assert.Equal(t, "2345", w.Body.String())
+
+	// The object is reused, so the second request reaches Open (which
+	// fails) rather than the lookup.
+	require.NoError(t, os.Remove(file))
+	w = get()
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.NotContains(t, w.Body.String(), "failed to find object")
+
+	// That failure dropped it: the next request looks it up again.
+	w = get()
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Contains(t, w.Body.String(), "failed to find object")
+}

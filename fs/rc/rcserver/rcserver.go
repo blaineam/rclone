@@ -24,6 +24,7 @@ import (
 	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fs/rc/jobs"
+	libcache "github.com/rclone/rclone/lib/cache"
 	libhttp "github.com/rclone/rclone/lib/http"
 	"github.com/rclone/rclone/lib/http/serve"
 	"github.com/skratchdot/open-golang/open"
@@ -57,8 +58,22 @@ type Server struct {
 	files          http.Handler
 	pluginsHandler http.Handler
 	opt            *rc.Options
-	noAuth         bool // snapshot of opt.NoAuth at startup to prevent runtime mutation
+	noAuth         bool            // snapshot of opt.NoAuth at startup to prevent runtime mutation
+	objects        *libcache.Cache // recently served objects, see serveObject
 }
+
+// servedObject is an entry in Server.objects
+type servedObject struct {
+	o       fs.Object
+	fetched time.Time
+}
+
+const (
+	// objectCacheIdle is how long a served object is reused after its last request
+	objectCacheIdle = time.Minute
+	// objectCacheMaxAge is how long a served object is reused at most
+	objectCacheMaxAge = 10 * time.Minute
+)
 
 func newServer(ctx context.Context, opt *rc.Options, mux *http.ServeMux) (*Server, error) {
 	fileHandler := http.Handler(nil)
@@ -81,6 +96,7 @@ func newServer(ctx context.Context, opt *rc.Options, mux *http.ServeMux) (*Serve
 		files:          fileHandler,
 		pluginsHandler: pluginsHandler,
 		noAuth:         opt.NoAuth,
+		objects:        libcache.New().SetExpireDuration(objectCacheIdle).SetExpireInterval(objectCacheIdle / 2),
 	}
 
 	var err error
@@ -419,13 +435,39 @@ func (s *Server) serveRemote(w http.ResponseWriter, r *http.Request, path string
 
 		directory.Serve(w, r)
 	} else {
-		path = strings.Trim(path, "/")
-		o, err := f.NewObject(r.Context(), path)
+		s.serveObject(w, r, f, fsName, strings.Trim(path, "/"))
+	}
+}
+
+// serveObject serves the object at path in f.
+//
+// A media player reads a file as many range requests in quick succession.
+// Looking the object up again for each one costs a round trip or more on
+// many backends (a directory listing, a download link), so the object is
+// reused for requests that follow closely. It is dropped when a request for
+// it fails, and refreshed periodically so a changed file is noticed.
+func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, f fs.Fs, fsName, path string) {
+	key := fsName + "\x00" + path
+	var o fs.Object
+	if value, ok := s.objects.GetMaybe(key); ok {
+		if entry := value.(servedObject); time.Since(entry.fetched) < objectCacheMaxAge {
+			o = entry.o
+		}
+	}
+	if o == nil {
+		var err error
+		o, err = f.NewObject(r.Context(), path)
 		if err != nil {
+			s.objects.Delete(key)
 			writeError(path, nil, w, fmt.Errorf("failed to find object: %w", err), http.StatusInternalServerError)
 			return
 		}
-		serve.Object(w, r, o)
+		s.objects.Put(key, servedObject{o: o, fetched: time.Now()})
+	}
+	ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+	serve.Object(ww, r, o)
+	if ww.Status() >= http.StatusInternalServerError || ww.Status() == http.StatusNotFound {
+		s.objects.Delete(key)
 	}
 }
 
